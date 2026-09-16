@@ -3,6 +3,13 @@
 Installs [atomic-usb](https://github.com/safewords/kubevirt-atomic-usb): the node agent (DaemonSet),
 the controller (Deployment), the `UsbDevice` / `UsbDeviceClaim` CRDs and RBAC.
 
+> [!CAUTION]
+> The agent is **privileged with host access on every node**, a `UsbDeviceClaim` grants **control of
+> physical USB devices on any node**, and USB traffic is **unencrypted** on the pod network. By
+> default every namespace editor may create claims (`rbac.aggregateToDefaultRoles: true`). Read the
+> [security documentation](https://github.com/safewords/kubevirt-atomic-usb/blob/main/SECURITY.md)
+> before installing.
+
 ## Install
 
 ```sh

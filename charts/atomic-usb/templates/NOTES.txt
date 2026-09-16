@@ -1,5 +1,15 @@
 atomic-usb {{ .Chart.AppVersion }} is installed in namespace {{ .Release.Namespace }}.
 
+**************************************************************************************************
+SECURITY: the agent is privileged on every node, a UsbDeviceClaim grants control of physical USB
+devices on any node, and USB traffic crosses the pod network unencrypted.
+{{- if .Values.rbac.aggregateToDefaultRoles }}
+Every user with the admin or edit role in any namespace can currently claim any device
+(rbac.aggregateToDefaultRoles=true).
+{{- end }}
+Hardening checklist: https://github.com/safewords/kubevirt-atomic-usb/blob/main/SECURITY.md
+**************************************************************************************************
+
 The agent pods are privileged. If Pod Security Admission is enforced, label the namespace:
 
   kubectl label namespace {{ .Release.Namespace }} pod-security.kubernetes.io/enforce=privileged

@@ -9,6 +9,7 @@
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-CE422B?logo=rust&logoColor=white)](Cargo.toml)
 [![KubeVirt](https://img.shields.io/badge/KubeVirt-usbredir-00AAB2)](https://kubevirt.io)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+[![Security: read before installing](https://img.shields.io/badge/security-read%20before%20installing-critical)](SECURITY.md)
 
 **atomic-usb** attaches USB devices plugged into **any** node of a Kubernetes cluster to
 **KubeVirt VMs running on any other node**, over the pod network, with hotplug.
@@ -16,6 +17,12 @@
 Plug a device into one node, run the VM on another, and the device shows up in the guest as a local
 USB device. Move the device to a different node and it is re-attached automatically; restart or
 live-migrate the VM and it comes back as well.
+
+> [!CAUTION]
+> **Read [SECURITY.md](SECURITY.md) before installing.** atomic-usb runs a **privileged agent with
+> host access on every node**, lets anyone who can create a `UsbDeviceClaim` take control of
+> **physical USB devices on any node**, and sends USB traffic **unencrypted** over the pod network.
+> It is not safe for shared or multi-tenant clusters without the hardening described there.
 
 - **Atomic**: every device is leased to exactly one claim through a compare-and-swap on the API
   server, and carries at most one data-path session at any time.
@@ -148,6 +155,11 @@ usb-1a86-7523-usb-serial-0a1b2c3d   1a86     7523      USB Serial    Descriptor 
 
 ## Install
 
+> [!WARNING]
+> The defaults let every namespace editor claim any USB device in the cluster. On shared clusters
+> install with `--set rbac.aggregateToDefaultRoles=false` and follow the
+> [hardening checklist](SECURITY.md#hardening-checklist).
+
 ```sh
 kubectl create namespace atomic-usb
 kubectl label namespace atomic-usb pod-security.kubernetes.io/enforce=privileged
@@ -247,10 +259,8 @@ for a test VM and claims.
   node takes over after the migration and the guest sees a brief replug.
 - **Node failure**: TCP keepalives detach devices from a dead peer within about a minute; devices
   on a node whose agent stops heartbeating are marked `Lost` after 90 seconds.
-- **Security**: the handshake is authenticated (HMAC-SHA256 with timestamp and nonce) and the
-  exporter checks the lease with the API server, but USB traffic itself is not encrypted. Use a CNI
-  with transparent encryption if the pod network is not trusted, and restrict who may create
-  `UsbDeviceClaim`s: a claim gives a VM full access to a device.
+- **Security**: see [SECURITY.md](SECURITY.md) for the threat model and a hardening checklist
+  (claim RBAC and admission policy, `agent.ignore`, NetworkPolicy, pod network encryption).
 - **Latency**: USB is carried over TCP. Serial adapters, HID devices, smart cards and mass storage
   work well; isochronous devices such as webcams and audio interfaces need a fast, quiet network.
 
