@@ -44,6 +44,11 @@ impl SocketLocator {
     }
 
     /// Returns the first existing socket for the VMI, falling back to scanning host processes.
+    ///
+    /// The fallback only considers processes that run in one of the VMI's launcher pods. Any
+    /// container can create a `/var/run/kubevirt-private/<vmi-uid>/` directory in its own
+    /// filesystem, and VMI UIDs are not secret, so accepting any process would let a pod on the
+    /// VM's node receive another tenant's USB device.
     pub fn locate(&self, vmi_uid: &str, launcher_pods: &[&str], slot: i32) -> Option<PathBuf> {
         if let Some(found) = self
             .candidates(vmi_uid, launcher_pods, slot)
@@ -53,6 +58,9 @@ impl SocketLocator {
             return Some(found);
         }
         let proc_root = self.proc_root.as_ref()?;
+        if launcher_pods.is_empty() {
+            return None;
+        }
         let relative = Path::new("root/var/run/kubevirt-private")
             .join(vmi_uid)
             .join(socket_name(slot));
@@ -64,9 +72,22 @@ impl SocketLocator {
                     .to_str()
                     .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()))
             })
+            .filter(|e| process_in_pods(&e.path(), launcher_pods))
             .map(|e| e.path().join(&relative))
             .find(|p| is_socket(p))
     }
+}
+
+/// Whether `/proc/<pid>` belongs to one of the pods, judged by its cgroup path, which contains the
+/// pod UID with dashes (cgroupfs driver) or underscores (systemd driver).
+fn process_in_pods(proc_pid: &Path, pod_uids: &[&str]) -> bool {
+    let Ok(cgroup) = fs::read_to_string(proc_pid.join("cgroup")) else {
+        return false;
+    };
+    pod_uids
+        .iter()
+        .filter(|uid| !uid.is_empty())
+        .any(|uid| cgroup.contains(&format!("pod{uid}")) || cgroup.contains(&format!("pod{}", uid.replace('-', "_"))))
 }
 
 fn is_socket(path: &Path) -> bool {
@@ -167,21 +188,55 @@ mod tests {
         server.await.unwrap();
     }
 
+    /// Creates `/proc/<pid>` with a cgroup file and a listening usbredir socket in its root.
+    fn fake_process(proc_root: &Path, pid: u32, cgroup: &str) -> (PathBuf, UnixListener) {
+        let base = proc_root.join(pid.to_string());
+        let dir = base.join("root/var/run/kubevirt-private").join(VMI_UID);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(base.join("cgroup"), cgroup).unwrap();
+        let socket = dir.join("virt-usbredir-0");
+        let listener = bind_long(&socket);
+        (socket, listener)
+    }
+
     #[tokio::test]
-    async fn falls_back_to_proc_root() {
+    async fn falls_back_to_launcher_processes_only() {
         let tmp = tempfile::tempdir().unwrap();
         let proc_root = tmp.path().join("proc");
-        let dir = proc_root.join("4242/root/var/run/kubevirt-private").join(VMI_UID);
-        fs::create_dir_all(&dir).unwrap();
         fs::create_dir_all(proc_root.join("self")).unwrap();
-        let _listener = bind_long(&dir.join("virt-usbredir-0"));
         let locator = SocketLocator {
             kubelet_root: tmp.path().join("kubelet"),
-            proc_root: Some(proc_root),
+            proc_root: Some(proc_root.clone()),
         };
-        assert_eq!(
-            locator.locate(VMI_UID, &[POD_UID], 0),
-            Some(dir.join("virt-usbredir-0"))
+
+        // Another pod on the node planted a socket for the VMI: it must never be used.
+        let (_, _decoy) = fake_process(
+            &proc_root,
+            1000,
+            "0::/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod11111111_2222_3333_4444_555555555555.slice/cri-containerd-abc.scope\n",
         );
+        assert_eq!(locator.locate(VMI_UID, &[POD_UID], 0), None);
+        assert_eq!(locator.locate(VMI_UID, &[], 0), None);
+
+        // systemd cgroup driver: pod UID with underscores.
+        let systemd = format!(
+            "0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod{}.slice/cri-containerd-def.scope\n",
+            POD_UID.replace('-', "_")
+        );
+        let (socket, _launcher) = fake_process(&proc_root, 4242, &systemd);
+        assert_eq!(locator.locate(VMI_UID, &[POD_UID], 0), Some(socket));
+    }
+
+    #[test]
+    fn cgroupfs_driver_pod_uids_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("cgroup"),
+            format!("0::/kubepods/burstable/pod{POD_UID}/0123abcd\n"),
+        )
+        .unwrap();
+        assert!(process_in_pods(tmp.path(), &[POD_UID]));
+        assert!(!process_in_pods(tmp.path(), &["11111111-2222-3333-4444-555555555555"]));
+        assert!(!process_in_pods(tmp.path(), &[""]));
     }
 }
