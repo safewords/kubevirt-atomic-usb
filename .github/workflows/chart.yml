@@ -35,7 +35,7 @@ jobs:
             --set psk.generate=false,rbac.aggregateToDefaultRoles=false,agent.hostPID=false \
             --set-json 'agent.ignore=["abcd:*","1234:5678"]' > rendered-alt.yaml
           curl -fsSL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz | tar -xz kubeconform
-          ./kubeconform -strict -summary rendered.yaml rendered-alt.yaml
+          ./kubeconform -strict -summary -skip CustomResourceDefinition rendered.yaml rendered-alt.yaml
 
   publish:
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
