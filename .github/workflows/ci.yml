@@ -18,6 +18,7 @@ on:
       - "rustfmt.toml"
       - "charts/atomic-usb/crds/**"
       - ".github/workflows/ci.yml"
+  workflow_dispatch:
 
 permissions:
   contents: read

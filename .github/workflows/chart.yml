@@ -2,7 +2,8 @@ name: Helm chart
 
 # The chart is versioned and released independently of the application: bump `version` in
 # charts/atomic-usb/Chart.yaml and merge to main to publish it to
-#   - the Helm repository at https://<owner>.github.io/<repo> (GitHub Pages, gh-pages branch)
+#   - the Helm repository on the gh-pages branch, served from
+#     https://raw.githubusercontent.com/<owner>/<repo>/gh-pages (chart packages are release assets)
 #   - oci://ghcr.io/<owner>/charts/atomic-usb
 on:
   push:
@@ -52,7 +53,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-      - name: Publish to the GitHub Pages Helm repository
+      - name: Publish to the Helm repository (gh-pages branch)
         uses: helm/chart-releaser-action@v1.7.0
         with:
           charts_dir: charts

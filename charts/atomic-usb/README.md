@@ -13,7 +13,7 @@ kubectl label namespace atomic-usb pod-security.kubernetes.io/enforce=privileged
 helm install atomic-usb oci://ghcr.io/safewords/charts/atomic-usb --namespace atomic-usb
 
 # or the classic Helm repository
-helm repo add atomic-usb https://safewords.github.io/kubevirt-atomic-usb
+helm repo add atomic-usb https://raw.githubusercontent.com/safewords/kubevirt-atomic-usb/gh-pages
 helm install atomic-usb atomic-usb/atomic-usb --namespace atomic-usb
 ```
 

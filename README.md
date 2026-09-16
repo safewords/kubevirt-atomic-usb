@@ -157,7 +157,7 @@ helm install atomic-usb oci://ghcr.io/safewords/charts/atomic-usb --namespace at
 or from the Helm repository:
 
 ```sh
-helm repo add atomic-usb https://safewords.github.io/kubevirt-atomic-usb
+helm repo add atomic-usb https://raw.githubusercontent.com/safewords/kubevirt-atomic-usb/gh-pages
 helm install atomic-usb atomic-usb/atomic-usb --namespace atomic-usb
 ```
 
