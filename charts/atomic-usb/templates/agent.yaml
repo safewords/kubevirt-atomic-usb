@@ -1,0 +1,136 @@
+{{- $fullname := include "atomic-usb.fullname" . -}}
+{{- $kubeletRoot := trimSuffix "/" .Values.agent.kubeletRoot -}}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ $fullname }}-agent
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "atomic-usb.labels" . | nindent 4 }}
+    {{- include "atomic-usb.selectorLabels" (dict "root" . "component" "agent") | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "atomic-usb.selectorLabels" (dict "root" . "component" "agent") | nindent 6 }}
+  updateStrategy:
+    {{- toYaml .Values.agent.updateStrategy | nindent 4 }}
+  template:
+    metadata:
+      labels:
+        {{- include "atomic-usb.selectorLabels" (dict "root" . "component" "agent") | nindent 8 }}
+        {{- with .Values.agent.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.agent.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ $fullname }}-agent
+      hostPID: {{ .Values.agent.hostPID }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.agent.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      containers:
+        - name: agent
+          image: {{ include "atomic-usb.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/atomic-usb", "agent"]
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # Agents reach each other through the pod network (CNI), not the host network.
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: ATOMIC_USB_LISTEN
+              value: {{ printf "%s:%d" .Values.agent.listenAddress (int .Values.agent.port) | quote }}
+            - name: ATOMIC_USB_PSK_FILE
+              value: /etc/atomic-usb/psk
+            - name: ATOMIC_USB_KUBELET_ROOT
+              value: {{ $kubeletRoot | quote }}
+            {{- if .Values.agent.hostPID }}
+            - name: ATOMIC_USB_HOST_PROC
+              value: /proc
+            {{- end }}
+            - name: ATOMIC_USB_IGNORE
+              value: {{ join "," .Values.agent.ignore | quote }}
+            - name: ATOMIC_USB_INCLUDE_HUBS
+              value: {{ .Values.agent.includeHubs | quote }}
+            - name: ATOMIC_USB_SCAN_INTERVAL_SECONDS
+              value: {{ .Values.agent.scanIntervalSeconds | quote }}
+            - name: ATOMIC_USB_HEARTBEAT_SECONDS
+              value: {{ .Values.agent.heartbeatSeconds | quote }}
+            - name: ATOMIC_USB_LOST_AFTER_SECONDS
+              value: {{ .Values.lostAfterSeconds | quote }}
+            - name: ATOMIC_USB_LOG_FORMAT
+              value: {{ .Values.logging.format | quote }}
+            - name: ATOMIC_USB_LOG_LEVEL
+              value: {{ .Values.logging.level | quote }}
+          ports:
+            - name: usbredir
+              containerPort: {{ .Values.agent.port }}
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: usbredir
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.agent.resources | nindent 12 }}
+          securityContext:
+            # usbfs access, detaching kernel drivers, and connecting to QEMU's usbredir sockets.
+            privileged: true
+          volumeMounts:
+            - name: dev-bus-usb
+              mountPath: /dev/bus/usb
+            - name: run-udev
+              mountPath: /run/udev
+              readOnly: true
+            - name: kubelet-pods
+              mountPath: {{ printf "%s/pods" $kubeletRoot }}
+              readOnly: true
+            - name: psk
+              mountPath: /etc/atomic-usb
+              readOnly: true
+      volumes:
+        - name: dev-bus-usb
+          hostPath:
+            path: /dev/bus/usb
+            type: DirectoryOrCreate
+        - name: run-udev
+          hostPath:
+            path: /run/udev
+            type: DirectoryOrCreate
+        - name: kubelet-pods
+          hostPath:
+            path: {{ printf "%s/pods" $kubeletRoot }}
+            type: Directory
+        - name: psk
+          secret:
+            secretName: {{ include "atomic-usb.pskSecretName" . }}
+            items:
+              - key: psk
+                path: psk
+      {{- with .Values.agent.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.agent.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.agent.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

@@ -1,0 +1,81 @@
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: ghcr.io/safewords/kubevirt-atomic-usb
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+logging:
+  # text or json
+  format: text
+  # trace, debug, info, warn or error
+  level: info
+
+# Pre-shared key that authenticates agents to each other on the pod network.
+psk:
+  # Secret holding the key under `psk`. Defaults to <fullname>-psk.
+  secretName: ""
+  # Let the controller create the secret with a random key when it does not exist.
+  # Set to false to provide your own secret.
+  generate: true
+
+# Devices whose agent has not sent a heartbeat for this long are marked Lost.
+lostAfterSeconds: 90
+
+controller:
+  resyncSeconds: 30
+  priorityClassName: ""
+  podAnnotations: {}
+  podLabels: {}
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      memory: 128Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+agent:
+  # TCP port agents use to reach each other over the pod network.
+  port: 7575
+  # Address the exporter binds to; use "[::]" on IPv6-only clusters.
+  listenAddress: 0.0.0.0
+  # Devices that are never published, as VENDOR:PRODUCT hex patterns where either side may be "*",
+  # e.g. ["abcd:*", "1234:5678"].
+  ignore: []
+  includeHubs: false
+  scanIntervalSeconds: 15
+  heartbeatSeconds: 30
+  # Kubelet root directory on the nodes; usbredir sockets live below <kubeletRoot>/pods.
+  kubeletRoot: /var/lib/kubelet
+  # Allows finding usbredir sockets through /proc/<pid>/root when kubeletRoot does not match.
+  hostPID: true
+  priorityClassName: system-node-critical
+  podAnnotations: {}
+  podLabels: {}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      memory: 256Mi
+  nodeSelector:
+    kubernetes.io/os: linux
+  # USB devices can be plugged into any node, so run everywhere by default.
+  tolerations:
+    - operator: Exists
+  affinity: {}
+
+rbac:
+  # Grant the built-in admin/edit/view roles access to UsbDeviceClaims.
+  aggregateToDefaultRoles: true

@@ -1,0 +1,82 @@
+{{- $fullname := include "atomic-usb.fullname" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}-controller
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "atomic-usb.labels" . | nindent 4 }}
+    {{- include "atomic-usb.selectorLabels" (dict "root" . "component" "controller") | nindent 4 }}
+spec:
+  # Leases are guarded by optimistic concurrency; a single replica avoids needless contention.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "atomic-usb.selectorLabels" (dict "root" . "component" "controller") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "atomic-usb.selectorLabels" (dict "root" . "component" "controller") | nindent 8 }}
+        {{- with .Values.controller.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.controller.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ $fullname }}-controller
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: controller
+          image: {{ include "atomic-usb.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/atomic-usb", "controller"]
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: ATOMIC_USB_PSK_SECRET
+              value: {{ ternary (include "atomic-usb.pskSecretName" .) "" .Values.psk.generate | quote }}
+            - name: ATOMIC_USB_LOST_AFTER_SECONDS
+              value: {{ .Values.lostAfterSeconds | quote }}
+            - name: ATOMIC_USB_RESYNC_SECONDS
+              value: {{ .Values.controller.resyncSeconds | quote }}
+            - name: ATOMIC_USB_LOG_FORMAT
+              value: {{ .Values.logging.format | quote }}
+            - name: ATOMIC_USB_LOG_LEVEL
+              value: {{ .Values.logging.level | quote }}
+          resources:
+            {{- toYaml .Values.controller.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      {{- with .Values.controller.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

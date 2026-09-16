@@ -1,0 +1,62 @@
+# A throwaway Fedora VM for trying out atomic-usb.
+#
+#   kubectl apply -f examples/test-vm.yaml
+#   kubectl get usbdevices                        # pick a device and edit examples/claim-by-serial.yaml
+#   kubectl apply -f examples/claim-by-serial.yaml
+#   kubectl -n atomic-usb-test get usbclaim -w
+#
+# To see a device cross nodes, plug it into one node and pin the VM to another one with the
+# commented nodeSelector below. Log in on the console as fedora / atomic-usb and run `lsblk` or
+# `cat /sys/bus/usb/devices/*/product`.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: atomic-usb-test
+---
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: test-vm
+  namespace: atomic-usb-test
+spec:
+  runStrategy: Always
+  template:
+    metadata:
+      labels:
+        kubevirt.io/vm: test-vm
+    spec:
+      # nodeSelector:
+      #   kubernetes.io/hostname: some-other-node
+      terminationGracePeriodSeconds: 0
+      domain:
+        cpu:
+          cores: 2
+        memory:
+          guest: 2Gi
+        devices:
+          # Required: creates the virt-usbredir-0..3 sockets atomic-usb attaches devices through.
+          clientPassthrough: {}
+          disks:
+            - name: containerdisk
+              disk:
+                bus: virtio
+            - name: cloudinitdisk
+              disk:
+                bus: virtio
+          interfaces:
+            - name: default
+              masquerade: {}
+      networks:
+        - name: default
+          pod: {}
+      volumes:
+        - name: containerdisk
+          containerDisk:
+            image: quay.io/containerdisks/fedora:latest
+        - name: cloudinitdisk
+          cloudInitNoCloud:
+            userData: |
+              #cloud-config
+              password: atomic-usb
+              chpasswd:
+                expire: false

@@ -1,0 +1,358 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: usbdevices.atomicusb.safewords.io
+spec:
+  group: atomicusb.safewords.io
+  names:
+    categories:
+    - atomic-usb
+    kind: UsbDevice
+    plural: usbdevices
+    shortNames:
+    - usbdev
+    singular: usbdevice
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.vendorId
+      name: Vendor
+      type: string
+    - jsonPath: .spec.productId
+      name: Product
+      type: string
+    - jsonPath: .spec.product
+      name: Description
+      type: string
+    - jsonPath: .spec.identity
+      name: Identity
+      type: string
+    - jsonPath: .status.node
+      name: Node
+      type: string
+    - jsonPath: .status.portPath
+      name: Port
+      priority: 1
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.attachedTo.claim
+      name: Claim
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for UsbDeviceSpec via `CustomResource`
+        properties:
+          spec:
+            description: A physical USB device plugged into a node. Maintained by the atomic-usb agent; do not edit.
+            properties:
+              bcdDevice:
+                nullable: true
+                type: string
+              identity:
+                description: Which attributes this object's name was derived from.
+                enum:
+                - Serial
+                - SerialDescriptor
+                - Descriptor
+                - PortPath
+                type: string
+              manufacturer:
+                nullable: true
+                type: string
+              product:
+                nullable: true
+                type: string
+              productId:
+                description: USB product id, 4 lowercase hex digits.
+                type: string
+              serial:
+                nullable: true
+                type: string
+              vendorId:
+                description: USB vendor id, 4 lowercase hex digits.
+                type: string
+            required:
+            - identity
+            - productId
+            - vendorId
+            type: object
+          status:
+            nullable: true
+            properties:
+              attachedTo:
+                description: |-
+                  Exclusive lease: the claim this device is reserved for. Written by the controller with
+                  optimistic concurrency, so at most one claim ever holds a device.
+                nullable: true
+                properties:
+                  claim:
+                    type: string
+                  claimUid:
+                    type: string
+                  namespace:
+                    type: string
+                  since:
+                    description: RFC 3339 time the lease was acquired.
+                    type: string
+                  vmName:
+                    type: string
+                required:
+                - claim
+                - claimUid
+                - namespace
+                - since
+                - vmName
+                type: object
+              busNum:
+                format: int64
+                nullable: true
+                type: integer
+              devNum:
+                format: int64
+                nullable: true
+                type: integer
+              deviceClass:
+                nullable: true
+                type: string
+              exporter:
+                description: Where the agent owning the device accepts usbredir sessions (pod network).
+                nullable: true
+                properties:
+                  address:
+                    description: Pod IP of the exporting agent.
+                    type: string
+                  pod:
+                    type: string
+                  port:
+                    format: int32
+                    type: integer
+                required:
+                - address
+                - pod
+                - port
+                type: object
+              interfaceClasses:
+                items:
+                  type: string
+                nullable: true
+                type: array
+              lastSeen:
+                description: RFC 3339 time of the last agent heartbeat.
+                nullable: true
+                type: string
+              message:
+                nullable: true
+                type: string
+              node:
+                description: Node the device is (or was last) plugged into.
+                nullable: true
+                type: string
+              phase:
+                enum:
+                - Available
+                - Unplugged
+                - Lost
+                nullable: true
+                type: string
+              portPath:
+                description: Physical port path on that node, e.g. `3-1.4`.
+                nullable: true
+                type: string
+              speed:
+                description: Negotiated speed in Mbit/s.
+                nullable: true
+                type: string
+            type: object
+        required:
+        - spec
+        title: UsbDevice
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: usbdeviceclaims.atomicusb.safewords.io
+spec:
+  group: atomicusb.safewords.io
+  names:
+    categories:
+    - atomic-usb
+    kind: UsbDeviceClaim
+    plural: usbdeviceclaims
+    shortNames:
+    - usbclaim
+    singular: usbdeviceclaim
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.vmName
+      name: VM
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.deviceName
+      name: Device
+      type: string
+    - jsonPath: .status.sourceNode
+      name: Device-Node
+      type: string
+    - jsonPath: .status.connection.node
+      name: VM-Node
+      type: string
+    - jsonPath: .status.slot
+      name: Slot
+      priority: 1
+      type: integer
+    - jsonPath: .status.message
+      name: Message
+      priority: 1
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for UsbDeviceClaimSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              Requests exclusive access to a USB device for a KubeVirt VM in the same namespace.
+
+              The VM must have `spec.template.spec.domain.devices.clientPassthrough: {}`. The device is
+              hot-plugged into the running VM as soon as both are available, and re-attached automatically
+              after the device is replugged (on any node) or the VM restarts or migrates.
+            properties:
+              selector:
+                description: Which device to attach. All specified fields must match; at least one is required.
+                properties:
+                  deviceName:
+                    description: Exact `UsbDevice` object name.
+                    nullable: true
+                    type: string
+                  node:
+                    description: Only devices plugged into this node.
+                    nullable: true
+                    type: string
+                  portPath:
+                    description: Only devices plugged into this port path (combine with `node`).
+                    nullable: true
+                    type: string
+                  product:
+                    description: Exact product string.
+                    nullable: true
+                    type: string
+                  productId:
+                    description: USB product id (hex, e.g. `ea60`).
+                    nullable: true
+                    type: string
+                  serial:
+                    description: Exact serial number.
+                    nullable: true
+                    type: string
+                  vendorId:
+                    description: USB vendor id (hex, e.g. `10c4`).
+                    nullable: true
+                    type: string
+                type: object
+              slot:
+                description: |-
+                  Pin the usbredir slot (0-3). By default slots are allocated from 3 downwards, because
+                  `virtctl usbredir` allocates from 0 upwards.
+                format: int32
+                maximum: 3.0
+                minimum: 0.0
+                nullable: true
+                type: integer
+              vmName:
+                description: Name of the VirtualMachine / VirtualMachineInstance in the claim's namespace.
+                type: string
+            required:
+            - selector
+            - vmName
+            type: object
+          status:
+            nullable: true
+            properties:
+              connection:
+                description: Data path state, reported by the agent on the VM's node.
+                nullable: true
+                properties:
+                  deviceName:
+                    type: string
+                  message:
+                    nullable: true
+                    type: string
+                  node:
+                    description: Node of the VM, where the connection is terminated.
+                    type: string
+                  since:
+                    description: RFC 3339 time of the last state change.
+                    type: string
+                  slot:
+                    format: int32
+                    type: integer
+                  state:
+                    enum:
+                    - Connecting
+                    - Connected
+                    - Disconnected
+                    type: string
+                required:
+                - deviceName
+                - node
+                - since
+                - slot
+                - state
+                type: object
+              deviceName:
+                description: '`UsbDevice` leased to this claim.'
+                nullable: true
+                type: string
+              message:
+                nullable: true
+                type: string
+              observedGeneration:
+                format: int64
+                nullable: true
+                type: integer
+              phase:
+                enum:
+                - Pending
+                - DeviceUnavailable
+                - WaitingForVM
+                - VMNotConfigured
+                - Connecting
+                - Attached
+                - Invalid
+                nullable: true
+                type: string
+              slot:
+                description: usbredir slot (`virt-usbredir-N` socket) used in the VM.
+                format: int32
+                nullable: true
+                type: integer
+              sourceNode:
+                description: Node the leased device is plugged into.
+                nullable: true
+                type: string
+            type: object
+        required:
+        - spec
+        title: UsbDeviceClaim
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

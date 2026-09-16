@@ -1,0 +1,25 @@
+atomic-usb {{ .Chart.AppVersion }} is installed in namespace {{ .Release.Namespace }}.
+
+The agent pods are privileged. If Pod Security Admission is enforced, label the namespace:
+
+  kubectl label namespace {{ .Release.Namespace }} pod-security.kubernetes.io/enforce=privileged
+
+Devices discovered on the nodes:
+
+  kubectl get usbdevices
+
+Attach one to a VM (the VM needs spec.template.spec.domain.devices.clientPassthrough: {}):
+
+  apiVersion: atomicusb.safewords.io/v1alpha1
+  kind: UsbDeviceClaim
+  metadata:
+    name: my-device
+    namespace: <vm-namespace>
+  spec:
+    vmName: <vm-name>
+    selector:
+      vendorId: "<vendor id>"
+      productId: "<product id>"
+      serial: "<serial>"
+
+CRDs in the chart's crds/ directory are not upgraded by `helm upgrade`; apply them manually when upgrading.

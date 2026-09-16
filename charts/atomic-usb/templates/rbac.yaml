@@ -1,0 +1,147 @@
+{{- $fullname := include "atomic-usb.fullname" . -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $fullname }}-agent
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "atomic-usb.labels" . | nindent 4 }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $fullname }}-controller
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "atomic-usb.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fullname }}-agent
+  labels:
+    {{- include "atomic-usb.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["atomicusb.safewords.io"]
+    resources: ["usbdevices"]
+    verbs: ["get", "list", "watch", "create", "patch"]
+  - apiGroups: ["atomicusb.safewords.io"]
+    resources: ["usbdevices/status"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["atomicusb.safewords.io"]
+    resources: ["usbdeviceclaims"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["atomicusb.safewords.io"]
+    resources: ["usbdeviceclaims/status"]
+    verbs: ["patch"]
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachineinstances"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $fullname }}-agent
+  labels:
+    {{- include "atomic-usb.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $fullname }}-agent
+subjects:
+  - kind: ServiceAccount
+    name: {{ $fullname }}-agent
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fullname }}-controller
+  labels:
+    {{- include "atomic-usb.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["atomicusb.safewords.io"]
+    resources: ["usbdevices", "usbdeviceclaims"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["atomicusb.safewords.io"]
+    resources: ["usbdevices/status", "usbdeviceclaims/status"]
+    verbs: ["patch"]
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachineinstances"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $fullname }}-controller
+  labels:
+    {{- include "atomic-usb.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $fullname }}-controller
+subjects:
+  - kind: ServiceAccount
+    name: {{ $fullname }}-controller
+    namespace: {{ .Release.Namespace }}
+{{- if .Values.psk.generate }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}-controller-psk
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "atomic-usb.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: [{{ include "atomic-usb.pskSecretName" . | quote }}]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}-controller-psk
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "atomic-usb.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}-controller-psk
+subjects:
+  - kind: ServiceAccount
+    name: {{ $fullname }}-controller
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- if .Values.rbac.aggregateToDefaultRoles }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fullname }}-edit
+  labels:
+    {{- include "atomic-usb.labels" . | nindent 4 }}
+    rbac.authorization.k8s.io/aggregate-to-admin: "true"
+    rbac.authorization.k8s.io/aggregate-to-edit: "true"
+rules:
+  - apiGroups: ["atomicusb.safewords.io"]
+    resources: ["usbdeviceclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fullname }}-view
+  labels:
+    {{- include "atomic-usb.labels" . | nindent 4 }}
+    rbac.authorization.k8s.io/aggregate-to-view: "true"
+rules:
+  - apiGroups: ["atomicusb.safewords.io"]
+    resources: ["usbdeviceclaims"]
+    verbs: ["get", "list", "watch"]
+{{- end }}

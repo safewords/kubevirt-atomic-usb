@@ -1,0 +1,122 @@
+name: Release
+
+# Pushes to main publish images tagged `main` and `sha-<commit>`.
+# Tags `vX.Y.Z` publish `X.Y.Z`, `X.Y` and `latest`, plus a GitHub release with binaries.
+# Path filters only apply to branch pushes; tag pushes always run.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Dockerfile"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  binaries:
+    name: Binary (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.arch }}
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar -C target/release -czf dist/atomic-usb-linux-${{ matrix.arch }}.tar.gz atomic-usb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atomic-usb-linux-${{ matrix.arch }}
+          path: dist/atomic-usb-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  image:
+    name: Container image
+    needs: binaries
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: atomic-usb-linux-*
+          merge-multiple: true
+          path: artifacts
+      - name: Unpack binaries per architecture
+        run: |
+          for arch in amd64 arm64; do
+            mkdir -p dist/$arch
+            tar -C dist/$arch -xzf artifacts/atomic-usb-linux-$arch.tar.gz
+          done
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=sha,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: prebuilt
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  github-release:
+    name: GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [binaries, image]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: atomic-usb-linux-*
+          merge-multiple: true
+          path: dist
+      - name: Add CRDs and checksums
+        run: |
+          cp charts/atomic-usb/crds/crds.yaml dist/atomic-usb-crds.yaml
+          (cd dist && sha256sum * > SHA256SUMS)
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

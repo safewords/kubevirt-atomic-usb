@@ -1,0 +1,22 @@
+# Attach a device that has no serial number, such as many CH340-based USB serial adapters.
+#
+# atomic-usb identifies such devices by their descriptor fingerprint, which still follows the
+# device across ports and nodes as long as it is the only one of its kind in the cluster. With
+# several identical devices, each is pinned to its node and port instead. Find the names with:
+#
+#   kubectl get usbdevices -l atomicusb.safewords.io/vendor-id=1a86,atomicusb.safewords.io/product-id=7523
+apiVersion: atomicusb.safewords.io/v1alpha1
+kind: UsbDeviceClaim
+metadata:
+  name: serial-adapter
+  namespace: atomic-usb-test
+spec:
+  vmName: test-vm
+  selector:
+    vendorId: "1a86"
+    productId: "7523"
+    # To choose between identical devices, name one explicitly:
+    # deviceName: usb-1a86-7523-usb-serial-0a1b2c3d
+    # or restrict by location:
+    # node: worker-1
+    # portPath: "1-2"

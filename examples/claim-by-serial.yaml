@@ -1,0 +1,16 @@
+# Attach one specific device, identified by its serial number, to the test VM. The device can be
+# plugged into any node, and the attachment follows it when it is moved to another node.
+#
+# Look up the ids and serial with:
+#   kubectl get usbdevices -o custom-columns=NAME:.metadata.name,VENDOR:.spec.vendorId,PRODUCT:.spec.productId,SERIAL:.spec.serial,NODE:.status.node
+apiVersion: atomicusb.safewords.io/v1alpha1
+kind: UsbDeviceClaim
+metadata:
+  name: my-device
+  namespace: atomic-usb-test
+spec:
+  vmName: test-vm
+  selector:
+    vendorId: "0781"
+    productId: "5581"
+    serial: "4C530001234567891234"
