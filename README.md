@@ -8,6 +8,7 @@
 [![Helm](https://img.shields.io/badge/helm-oci%20%7C%20repo-0F1689?logo=helm&logoColor=white)](charts/atomic-usb)
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-CE422B?logo=rust&logoColor=white)](Cargo.toml)
 [![KubeVirt](https://img.shields.io/badge/KubeVirt-usbredir-00AAB2)](https://kubevirt.io)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
 **atomic-usb** attaches USB devices plugged into **any** node of a Kubernetes cluster to
 **KubeVirt VMs running on any other node**, over the pod network, with hotplug.
@@ -293,3 +294,16 @@ docker build -t atomic-usb .
   `ghcr.io/safewords/kubevirt-atomic-usb:X.Y.Z` and creates a GitHub release.
 - Helm chart: bump `version` (and `appVersion`) in `charts/atomic-usb/Chart.yaml` and merge to
   `main`. CI publishes it to the Helm repository and to `oci://ghcr.io/safewords/charts/atomic-usb`.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this
+project by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any
+additional terms or conditions.

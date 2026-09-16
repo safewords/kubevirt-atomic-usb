@@ -3,6 +3,8 @@ name = "kubevirt-atomic-usb"
 version = "0.1.0"
 edition = "2024"
 description = "Attach USB devices plugged into any Kubernetes node to KubeVirt VMs anywhere in the cluster, with hotplug"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/safewords/kubevirt-atomic-usb"
 
 [[bin]]
 name = "atomic-usb"
