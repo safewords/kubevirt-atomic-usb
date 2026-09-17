@@ -14,6 +14,8 @@ pub const USBREDIR_SLOTS: i32 = 4;
 const KIND_VM: &str = "VirtualMachine";
 const KIND_VMI: &str = "VirtualMachineInstance";
 const API_VERSION: &str = "kubevirt.io/v1";
+const CONDITION_PAUSED: &str = "Paused";
+const START_STRATEGY_PAUSED: &str = "Paused";
 
 pub fn vmi_resource() -> ApiResource {
     ApiResource::from_gvk_with_plural(
@@ -35,6 +37,13 @@ pub struct VmiInfo {
     pub node: Option<String>,
     /// `spec.domain.devices.clientPassthrough` is set, so usbredir sockets exist.
     pub client_passthrough: bool,
+    /// `spec.startStrategy: Paused`: KubeVirt started this instance with its vCPUs stopped.
+    pub start_paused: bool,
+    /// The `Paused` condition is true: the vCPUs are stopped, so QEMU ignores its usbredir
+    /// chardevs and the guest sees nothing of an attached device until it resumes.
+    pub paused: bool,
+    /// RFC 3339 time the `Paused` condition last changed, i.e. when the pause began.
+    pub paused_since: Option<String>,
     /// virt-launcher pod UID -> node name. Contains two pods during live migration.
     pub active_pods: BTreeMap<String, String>,
     /// Created and controlled by a `VirtualMachine` (as opposed to a bare VMI).
@@ -65,6 +74,15 @@ impl VmiInfo {
             .owner_references()
             .iter()
             .any(|r| r.kind == KIND_VM && r.controller == Some(true));
+        let paused_condition = status
+            .and_then(|s| s.get("conditions"))
+            .and_then(|v| v.as_array())
+            .and_then(|conditions| {
+                conditions
+                    .iter()
+                    .find(|c| c.get("type").and_then(|v| v.as_str()) == Some(CONDITION_PAUSED))
+            })
+            .filter(|c| c.get("status").and_then(|v| v.as_str()) == Some("True"));
         Some(Self {
             namespace: obj.namespace()?,
             name: obj.name_any(),
@@ -72,6 +90,9 @@ impl VmiInfo {
             phase: str_at(status, "phase"),
             node: str_at(status, "nodeName").filter(|n| !n.is_empty()),
             client_passthrough,
+            start_paused: str_at(spec, "startStrategy").as_deref() == Some(START_STRATEGY_PAUSED),
+            paused: paused_condition.is_some(),
+            paused_since: paused_condition.and_then(|c| str_at(Some(c), "lastTransitionTime")),
             active_pods,
             controlled_by_vm,
             deleting: obj.metadata.deletion_timestamp.is_some(),
@@ -99,6 +120,9 @@ pub struct VmInfo {
     pub uid: String,
     /// `spec.template.spec.domain.devices.clientPassthrough` is set.
     pub client_passthrough: bool,
+    /// `spec.template.spec.startStrategy: Paused`, i.e. instances start with stopped vCPUs and
+    /// their boot can be held (see `UsbDeviceClaimSpec::hold_boot`).
+    pub start_paused: bool,
     /// `status.printableStatus`, e.g. `Stopped` or `Running`.
     pub printable_status: Option<String>,
     pub deleting: bool,
@@ -114,6 +138,11 @@ impl VmInfo {
                 .data
                 .pointer("/spec/template/spec/domain/devices/clientPassthrough")
                 .is_some_and(|v| !v.is_null()),
+            start_paused: obj
+                .data
+                .pointer("/spec/template/spec/startStrategy")
+                .and_then(|v| v.as_str())
+                == Some(START_STRATEGY_PAUSED),
             printable_status: obj
                 .data
                 .pointer("/status/printableStatus")
@@ -162,6 +191,19 @@ pub fn vm_owner(vm: Option<&VmInfo>, vmi: Option<&VmiInfo>) -> Option<VmOwner> {
         name: vmi.name.clone(),
         uid: vmi.uid.clone(),
     })
+}
+
+/// Resumes a paused `VirtualMachineInstance` through KubeVirt's subresource API, the same call
+/// `virtctl unpause` makes. Needs `update` on `virtualmachineinstances/unpause` in the
+/// `subresources.kubevirt.io` group.
+pub async fn unpause(client: &kube::Client, namespace: &str, name: &str) -> anyhow::Result<()> {
+    let path =
+        format!("/apis/subresources.kubevirt.io/v1/namespaces/{namespace}/virtualmachineinstances/{name}/unpause");
+    let request = http::Request::put(path)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(b"{}".to_vec())?;
+    client.request_text(request).await?;
+    Ok(())
 }
 
 /// Whether the claim's VM exists and is not being deleted, i.e. whether it may hold a device.
@@ -233,6 +275,35 @@ mod tests {
     }
 
     #[test]
+    fn parses_a_vmi_that_started_paused() {
+        let info = vmi(serde_json::json!({
+            "apiVersion": "kubevirt.io/v1", "kind": "VirtualMachineInstance",
+            "metadata": {"name": "my-vm", "namespace": "default", "uid": "b7e1"},
+            "spec": {"startStrategy": "Paused", "domain": {"devices": {"clientPassthrough": {}}}},
+            "status": {"phase": "Running", "nodeName": "node-a", "conditions": [
+                {"type": "Ready", "status": "False", "lastTransitionTime": "2026-09-17T12:00:01Z"},
+                {"type": "Paused", "status": "True", "reason": "PausedByUser",
+                 "lastTransitionTime": "2026-09-17T12:00:02Z"}
+            ]}
+        }));
+        assert!(info.start_paused);
+        assert!(info.paused);
+        assert!(info.is_running(), "a paused instance still runs, its vCPUs do not");
+        assert_eq!(info.paused_since.as_deref(), Some("2026-09-17T12:00:02Z"));
+
+        // Resumed: KubeVirt flips the condition to False rather than removing it.
+        let resumed = vmi(serde_json::json!({
+            "apiVersion": "kubevirt.io/v1", "kind": "VirtualMachineInstance",
+            "metadata": {"name": "my-vm", "namespace": "default", "uid": "b7e1"},
+            "spec": {"startStrategy": "Paused"},
+            "status": {"conditions": [{"type": "Paused", "status": "False"}]}
+        }));
+        assert!(resumed.start_paused);
+        assert!(!resumed.paused);
+        assert_eq!(resumed.paused_since, None);
+    }
+
+    #[test]
     fn parses_vmi_without_passthrough_or_status() {
         let info = vmi(serde_json::json!({
             "apiVersion": "kubevirt.io/v1", "kind": "VirtualMachineInstance",
@@ -260,10 +331,12 @@ mod tests {
             "apiVersion": "kubevirt.io/v1", "kind": "VirtualMachine",
             "metadata": {"name": "my-vm", "namespace": "default", "uid": "vm-uid",
                          "deletionTimestamp": "2026-09-17T02:00:00Z"},
-            "spec": {"template": {"spec": {"domain": {"devices": {"clientPassthrough": {}}}}}},
+            "spec": {"template": {"spec": {"startStrategy": "Paused",
+                                           "domain": {"devices": {"clientPassthrough": {}}}}}},
             "status": {"printableStatus": "Stopped"}
         }));
         assert!(v.client_passthrough);
+        assert!(v.start_paused);
         assert!(v.deleting);
         assert_eq!(v.printable_status.as_deref(), Some("Stopped"));
 
@@ -282,6 +355,7 @@ mod tests {
             name: "my-vm".into(),
             uid: uid.into(),
             client_passthrough: true,
+            start_paused: false,
             printable_status: None,
             deleting,
         }
@@ -295,6 +369,9 @@ mod tests {
             phase: Some("Running".into()),
             node: Some("node-a".into()),
             client_passthrough: true,
+            start_paused: false,
+            paused: false,
+            paused_since: None,
             active_pods: BTreeMap::new(),
             controlled_by_vm,
             deleting,

@@ -253,6 +253,73 @@ several devices (e.g. only `vendorId` and `productId`) lease one of them; if it 
 while another matching device is free, the claim moves to that one. See [`examples/`](examples/)
 for a test VM and claims.
 
+### Holding a VM's boot until its devices are ready
+
+Hotplug is not always enough. A guest that boots without its device often never picks it up: think
+of a home automation service that opens its Zigbee radio once at startup, or a licence dongle a
+daemon looks for while it starts. If the VM wins the race against its devices — the VM's node was
+busy, an agent was restarting, the device's node had just rebooted — the guest comes up broken and
+someone has to restart a service inside it.
+
+`holdBoot` closes that race. KubeVirt starts the VM with its vCPUs paused, atomic-usb splices every
+held device onto its usbredir slot, and only then resumes the VM, so the guest finds the devices
+plugged in on its very first boot:
+
+```yaml
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+spec:
+  template:
+    spec:
+      startStrategy: Paused          # required: KubeVirt starts the VM with stopped vCPUs
+      domain:
+        devices:
+          clientPassthrough: {}
+---
+apiVersion: atomicusb.safewords.io/v1alpha1
+kind: UsbDeviceClaim
+metadata:
+  name: zigbee-radio
+  namespace: default
+spec:
+  vmName: home-assistant
+  selector:
+    vendorId: "1a86"
+    productId: "7523"
+  holdBoot:
+    timeoutSeconds: 300            # optional, default 300; 0 waits forever
+```
+
+```console
+$ kubectl get usbclaim zigbee-radio -o jsonpath='{.status.bootHold}' | jq
+{
+  "state": "Holding",
+  "vmiUid": "4e84a490-7695-45d7-b997-04222d430df7",
+  "since": "2026-09-17T18:20:04Z",
+  "message": "waiting for zigbee-radio (283s left)"
+}
+```
+
+The hold applies to **every** start of the VM, including restarts and a VM that comes back after a
+node failure. It ends as soon as all the VM's holding claims are ready, and a device that never
+turns up delays the boot by `timeoutSeconds` instead of preventing it (`state: Released`, with the
+reason in `message`). Points worth knowing:
+
+- **A paused QEMU ignores its usbredir chardevs**, so a held device does not reach `Attached` while
+  the VM waits: the claim stays `Connecting` with `status.connection.awaitingResume: true`, which is
+  what tells the controller the slot is ready. QEMU takes the device within milliseconds of the
+  resume, well before the guest's firmware looks at the USB bus.
+- **A hold starts at the next start.** Adding `holdBoot` to a claim of a running VM, or giving the
+  VM `startStrategy: Paused`, changes nothing until it restarts. `status.bootHold` describes the
+  VM's current instance and is absent while there is nothing to hold; the `NotConfigured` state
+  above appears only while neither the running instance nor the template starts paused.
+- **Only boots are released.** atomic-usb resumes an instance once; a VM that someone pauses later
+  (`virtctl pause`) stays paused.
+- **Invalid claims never hold a boot**, so a typo in a selector cannot leave a VM paused.
+- `timeoutSeconds: 0` waits forever. Use it only where a VM is useless without its device, and
+  where you are happy for it to stay paused until someone plugs the device back in.
+- The VM can always be resumed by hand with `virtctl unpause`, which ends the hold.
+
 ## Operational notes
 
 - **Slots**: KubeVirt creates four usbredir sockets per VM. atomic-usb allocates them from 3

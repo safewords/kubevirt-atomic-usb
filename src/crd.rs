@@ -183,6 +183,8 @@ impl UsbDevice {
 ///
 /// The claim belongs to its VM: a stopped VM keeps the device reserved, while deleting the VM
 /// releases the device and garbage-collects the claim.
+///
+/// With `holdBoot`, a VM that starts paused waits for its device instead of booting without it.
 #[derive(CustomResource, Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[kube(
     group = "atomicusb.safewords.io",
@@ -199,6 +201,12 @@ impl UsbDevice {
     printcolumn(name = "Device-Node", type_ = "string", json_path = ".status.sourceNode"),
     printcolumn(name = "VM-Node", type_ = "string", json_path = ".status.connection.node"),
     printcolumn(name = "Slot", type_ = "integer", json_path = ".status.slot", priority = 1),
+    printcolumn(
+        name = "Boot-Hold",
+        type_ = "string",
+        json_path = ".status.bootHold.state",
+        priority = 1
+    ),
     printcolumn(name = "Message", type_ = "string", json_path = ".status.message", priority = 1),
     printcolumn(name = "Age", type_ = "date", json_path = ".metadata.creationTimestamp")
 )]
@@ -213,6 +221,34 @@ pub struct UsbDeviceClaimSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0, max = 3))]
     pub slot: Option<i32>,
+    /// Keep the VM's vCPUs paused after it starts until this device is ready, so the guest never
+    /// boots without it (a guest that boots first often never picks the device up: think of a
+    /// serial radio a home automation service opens once at startup).
+    ///
+    /// Requires `spec.template.spec.startStrategy: Paused` on the VM. KubeVirt then starts the VM
+    /// paused, atomic-usb splices the device onto its usbredir slot, and resumes the VM once every
+    /// claim of it that holds the boot is ready, or `timeoutSeconds` have passed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_boot: Option<HoldBoot>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HoldBoot {
+    /// Let the VM boot without the device after this many seconds (default 300). `0` waits
+    /// forever, which leaves a VM whose device never appears paused indefinitely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0))]
+    pub timeout_seconds: Option<i64>,
+}
+
+impl HoldBoot {
+    pub const DEFAULT_TIMEOUT_SECONDS: i64 = 300;
+
+    /// Seconds to hold the boot; `0` means forever.
+    pub fn timeout_seconds(&self) -> i64 {
+        self.timeout_seconds.unwrap_or(Self::DEFAULT_TIMEOUT_SECONDS).max(0)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -305,6 +341,33 @@ pub struct UsbDeviceClaimStatus {
     /// Data path state, reported by the agent on the VM's node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection: Option<ConnectionStatus>,
+    /// Whether this claim is holding the boot of the VM's current instance (see `spec.holdBoot`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_hold: Option<BootHoldStatus>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BootHoldStatus {
+    pub state: BootHoldState,
+    /// UID of the `VirtualMachineInstance` this applies to. A restarted VM is a new instance and
+    /// is held again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vmi_uid: Option<String>,
+    /// RFC 3339 time of the last state change.
+    pub since: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum BootHoldState {
+    /// The VM is paused and waiting for its devices.
+    Holding,
+    /// The VM was resumed, with the devices or after the timeout.
+    Released,
+    /// The VM's template does not set `startStrategy: Paused`, so its boot cannot be held.
+    NotConfigured,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -337,6 +400,11 @@ pub struct ConnectionStatus {
     pub since: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// The device is spliced onto the VM's usbredir slot and waits for the VM to resume: a paused
+    /// QEMU does not touch its usbredir chardev, so the device is only taken once the vCPUs run.
+    /// This is what lets the controller release a held boot (see `spec.holdBoot`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awaiting_resume: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

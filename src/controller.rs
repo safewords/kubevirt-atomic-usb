@@ -23,9 +23,11 @@ use kube::{Api, Client, ResourceExt};
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
-use crate::crd::{Attachment, ClaimPhase, ConnectionState, DevicePhase, UsbDevice, UsbDeviceClaim};
+use crate::crd::{
+    Attachment, BootHoldState, BootHoldStatus, ClaimPhase, ConnectionState, DevicePhase, UsbDevice, UsbDeviceClaim,
+};
 use crate::kubevirt::{
-    USBREDIR_SLOTS, VmInfo, VmiInfo, claim_owner_references, vm_owner, vm_present, vm_resource, vmi_resource,
+    USBREDIR_SLOTS, VmInfo, VmiInfo, claim_owner_references, unpause, vm_owner, vm_present, vm_resource, vmi_resource,
 };
 use crate::util;
 
@@ -46,6 +48,10 @@ struct Ctx {
     devices: Store<UsbDevice>,
     vms: Store<DynamicObject>,
     vmis: Store<DynamicObject>,
+    /// VMIs this controller resumed, with the reason, keyed by VMI UID. A boot is held once per
+    /// instance: this remembers the release even when writing it to the claims failed, so a VM a
+    /// user pauses later is never resumed behind their back.
+    released: std::sync::Mutex<HashMap<String, String>>,
 }
 
 pub async fn run(client: Client, config: ControllerConfig) -> anyhow::Result<()> {
@@ -91,6 +97,7 @@ pub async fn run(client: Client, config: ControllerConfig) -> anyhow::Result<()>
         devices,
         vms,
         vmis,
+        released: Default::default(),
     });
     let mut rx = changes.subscribe();
     let control_loop = async {
@@ -223,16 +230,47 @@ async fn reconcile_all(ctx: &Ctx) -> anyhow::Result<bool> {
             .collect::<Vec<_>>(),
     );
 
+    // Claims that hold their VM's boot, grouped by VM, for the boot-hold pass below.
+    let mut holds: BTreeMap<(String, String), Vec<BootHoldClaim>> = BTreeMap::new();
     for claim in &claims {
         match reconcile_claim(ctx, claim, &mut devices, &vms, &vmis, &slots, now).await {
-            Ok(r) => requeue |= r,
+            Ok(outcome) => {
+                requeue |= outcome.requeue;
+                if let Some(hold) = outcome.hold {
+                    let key = (claim.namespace().unwrap_or_default(), claim.spec.vm_name.clone());
+                    holds.entry(key).or_default().push(hold);
+                }
+            }
             Err(err) => {
                 warn!(claim = %format!("{}/{}", claim.namespace().unwrap_or_default(), claim.name_any()), "reconcile failed: {err:#}");
                 requeue = true;
             }
         }
     }
+
+    // Forget instances that are gone; their successors are held again.
+    let live_vmis: HashSet<&str> = vmis.values().map(|v| v.uid.as_str()).collect();
+    if let Ok(mut released) = ctx.released.lock() {
+        released.retain(|uid, _| live_vmis.contains(uid.as_str()));
+    }
+    for (key, hold_claims) in &holds {
+        match reconcile_boot_hold(ctx, key, hold_claims, vms.get(key), vmis.get(key), now).await {
+            Ok(r) => requeue |= r,
+            Err(err) => {
+                warn!(vm = %format!("{}/{}", key.0, key.1), "boot hold failed: {err:#}");
+                requeue = true;
+            }
+        }
+    }
     Ok(requeue)
+}
+
+/// What the boot-hold pass needs to know about a reconciled claim.
+struct ClaimOutcome {
+    /// A quick retry is needed (lost an optimistic-concurrency race).
+    requeue: bool,
+    /// Set when the claim holds its VM's boot (`spec.holdBoot`).
+    hold: Option<BootHoldClaim>,
 }
 
 async fn reconcile_claim(
@@ -243,7 +281,7 @@ async fn reconcile_claim(
     vmis: &HashMap<(String, String), VmiInfo>,
     slots: &HashMap<String, Result<i32, String>>,
     now: jiff::Timestamp,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<ClaimOutcome> {
     let uid = claim.uid().unwrap_or_default();
     let namespace = claim.namespace().unwrap_or_default();
     let lost_after = ctx.config.lost_after.as_secs() as i64;
@@ -390,22 +428,264 @@ async fn reconcile_claim(
         "message": previous.message,
         "observedGeneration": previous.observed_generation,
     });
-    if desired != current {
+    // A claim that no longer holds a boot must not keep a stale report.
+    let stale_boot_hold = claim.spec.hold_boot.is_none() && previous.boot_hold.is_some();
+    if desired != current || stale_boot_hold {
         if previous.phase != Some(phase) {
             info!(claim = %format!("{namespace}/{}", claim.name_any()), ?phase, %message, "claim phase changed");
+        }
+        let mut status = desired;
+        if stale_boot_hold {
+            status["bootHold"] = Value::Null;
         }
         let api: Api<UsbDeviceClaim> = Api::namespaced(ctx.client.clone(), &namespace);
         match api
             .patch_status(
                 &claim.name_any(),
                 &PatchParams::default(),
-                &Patch::Merge(&json!({ "status": desired })),
+                &Patch::Merge(&json!({ "status": status })),
             )
             .await
         {
             Ok(_) => {}
             Err(err) if util::is_not_found(&err) => {}
             Err(err) => return Err(err.into()),
+        }
+    }
+
+    // The device counts as ready for a held boot once it is attached, or spliced onto the slot of
+    // a paused VM that only has to resume to take it.
+    let ready = phase == ClaimPhase::Attached
+        || previous.connection.as_ref().is_some_and(|c| {
+            c.awaiting_resume == Some(true)
+                && Some(c.node.as_str()) == vmi.and_then(|v| v.node.as_deref())
+                && Some(&c.device_name) == target.as_ref()
+                && Some(c.slot) == slot
+        });
+    Ok(ClaimOutcome {
+        requeue,
+        hold: claim.spec.hold_boot.as_ref().map(|hold| BootHoldClaim {
+            name: claim.name_any(),
+            ready,
+            invalid: invalid.is_some(),
+            timeout_seconds: hold.timeout_seconds(),
+            current: previous.boot_hold.clone(),
+        }),
+    })
+}
+
+/// A claim that holds its VM's boot, as seen by the boot-hold pass.
+pub struct BootHoldClaim {
+    pub name: String,
+    /// The device is attached, or waiting on the slot for the VM to resume.
+    pub ready: bool,
+    /// The claim can never become ready, so it must not keep the VM from booting.
+    pub invalid: bool,
+    /// Seconds to hold the boot; `0` waits forever.
+    pub timeout_seconds: i64,
+    /// What the claim's status currently says, to avoid rewriting it.
+    pub current: Option<BootHoldStatus>,
+}
+
+pub struct BootHoldInputs<'a> {
+    pub vm: Option<&'a VmInfo>,
+    pub vmi: Option<&'a VmiInfo>,
+    pub claims: &'a [BootHoldClaim],
+    /// This instance's boot was already released (by us, or in a previous controller lifetime).
+    pub already_released: bool,
+    pub now: jiff::Timestamp,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BootHoldAction {
+    /// Leave the VM paused; the message says what is still missing.
+    Hold(String),
+    /// Resume the VM, with the devices or because waiting took too long.
+    Release(String),
+    /// The VM does not start paused, so its boot cannot be held.
+    NotConfigured(String),
+    /// Nothing to do: no instance to hold, nothing holding it, or already resumed.
+    Nothing,
+}
+
+/// Decides what to do with the boot of one VM whose claims ask for `holdBoot`.
+///
+/// A VM started with `startStrategy: Paused` waits with stopped vCPUs until every device is ready
+/// (see [`crate::agent::attacher`]), so the guest finds them all plugged in on its first boot
+/// instead of coming up without them. The timeout is the safety valve: a device that never shows
+/// up delays the boot, it does not prevent it.
+pub fn decide_boot_hold(inputs: &BootHoldInputs) -> BootHoldAction {
+    // An invalid claim can never become ready, so it must not hold anything up.
+    let holding: Vec<&BootHoldClaim> = inputs.claims.iter().filter(|c| !c.invalid).collect();
+    if holding.is_empty() {
+        return BootHoldAction::Nothing;
+    }
+    if inputs.vm.is_none() && inputs.vmi.is_none() {
+        return BootHoldAction::Nothing;
+    }
+    // The running instance is what can be held now, the template is what the next start uses; the
+    // hint below is only worth making when neither of them starts paused.
+    let starts_paused = inputs.vmi.is_some_and(|vmi| vmi.start_paused) || inputs.vm.is_some_and(|vm| vm.start_paused);
+    if !starts_paused {
+        return BootHoldAction::NotConfigured(
+            "the VM does not start paused; set spec.template.spec.startStrategy: Paused in its template to hold its boot"
+                .into(),
+        );
+    }
+    let Some(vmi) = inputs.vmi.filter(|vmi| vmi.paused && !vmi.deleting) else {
+        return BootHoldAction::Nothing;
+    };
+    if inputs.already_released {
+        return BootHoldAction::Nothing;
+    }
+    let missing: Vec<&str> = holding.iter().filter(|c| !c.ready).map(|c| c.name.as_str()).collect();
+    if missing.is_empty() {
+        return BootHoldAction::Release(match holding.len() {
+            1 => "the device is ready".to_string(),
+            n => format!("all {n} devices are ready"),
+        });
+    }
+    let missing = missing.join(", ");
+    // The longest timeout wins, and one claim asking to wait forever holds the whole VM.
+    let forever = holding.iter().any(|c| c.timeout_seconds == 0);
+    let timeout = holding.iter().map(|c| c.timeout_seconds).max().unwrap_or(0);
+    let waited = util::age_secs(vmi.paused_since.as_deref(), inputs.now)
+        .unwrap_or(0)
+        .max(0);
+    if !forever && waited >= timeout {
+        return BootHoldAction::Release(format!("gave up after {timeout}s; booting without {missing}"));
+    }
+    BootHoldAction::Hold(if forever {
+        format!("waiting for {missing}")
+    } else {
+        format!("waiting for {missing} ({}s left)", timeout - waited)
+    })
+}
+
+/// Applies [`decide_boot_hold`] for one VM: resumes it when its devices are ready, and keeps the
+/// holding claims' status up to date.
+async fn reconcile_boot_hold(
+    ctx: &Ctx,
+    (namespace, vm_name): &(String, String),
+    claims: &[BootHoldClaim],
+    vm: Option<&VmInfo>,
+    vmi: Option<&VmiInfo>,
+    now: jiff::Timestamp,
+) -> anyhow::Result<bool> {
+    let vmi_uid = vmi.map(|v| v.uid.as_str());
+    let released_reason =
+        vmi_uid.and_then(|uid| ctx.released.lock().ok().and_then(|released| released.get(uid).cloned()));
+    let already_released = released_reason.is_some()
+        || claims.iter().any(|c| {
+            c.current.as_ref().is_some_and(|b| {
+                b.state == BootHoldState::Released && b.vmi_uid.as_deref() == vmi_uid && vmi_uid.is_some()
+            })
+        });
+
+    let action = decide_boot_hold(&BootHoldInputs {
+        vm,
+        vmi,
+        claims,
+        already_released,
+        now,
+    });
+    let vm_ref = format!("{namespace}/{vm_name}");
+    let (state, message) = match action {
+        BootHoldAction::Hold(message) => (BootHoldState::Holding, message),
+        BootHoldAction::NotConfigured(message) => (BootHoldState::NotConfigured, message),
+        BootHoldAction::Release(reason) => {
+            let vmi = vmi.expect("a release decision has an instance");
+            info!(vm = %vm_ref, %reason, "resuming the VM");
+            if let Err(err) = unpause(&ctx.client, namespace, vm_name).await {
+                warn!(vm = %vm_ref, "resuming the VM failed: {err:#}");
+                return Ok(true);
+            }
+            if let Ok(mut released) = ctx.released.lock() {
+                released.insert(vmi.uid.clone(), reason.clone());
+            }
+            (BootHoldState::Released, reason)
+        }
+        // Record a release whose status write did not make it through earlier, and otherwise drop
+        // reports that no longer describe the VM.
+        BootHoldAction::Nothing => match released_reason {
+            Some(reason) => (BootHoldState::Released, reason),
+            None => return clear_stale_boot_holds(ctx, namespace, claims, vmi_uid).await,
+        },
+    };
+
+    let vmi_uid = match state {
+        BootHoldState::NotConfigured => None,
+        _ => vmi_uid.map(str::to_string),
+    };
+    let mut requeue = false;
+    for claim in claims {
+        let desired = BootHoldStatus {
+            state,
+            vmi_uid: vmi_uid.clone(),
+            // Keep the time of the last real change.
+            since: match &claim.current {
+                Some(current) if current.state == state && current.vmi_uid == vmi_uid => current.since.clone(),
+                _ => util::rfc3339(now),
+            },
+            message: Some(message.clone()),
+        };
+        if claim.current.as_ref() == Some(&desired) {
+            continue;
+        }
+        let api: Api<UsbDeviceClaim> = Api::namespaced(ctx.client.clone(), namespace);
+        let patch = json!({ "status": { "bootHold": desired } });
+        match api
+            .patch_status(&claim.name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await
+        {
+            Ok(_) => {}
+            Err(err) if util::is_not_found(&err) => {}
+            Err(err) => {
+                warn!(claim = %format!("{namespace}/{}", claim.name), "writing the boot hold failed: {err:#}");
+                requeue = true;
+            }
+        }
+    }
+    Ok(requeue)
+}
+
+/// Whether a boot-hold report has stopped describing the VM, e.g. advice to set
+/// `startStrategy: Paused` on a VM whose template has since been given it, or the record of an
+/// instance that has been replaced. The release record of the *current* instance is not stale: it
+/// is what keeps a VM that someone pauses later from being resumed.
+fn boot_hold_is_stale(current: Option<&BootHoldStatus>, vmi_uid: Option<&str>) -> bool {
+    match current {
+        None => false,
+        Some(current) => {
+            !(current.state == BootHoldState::Released && vmi_uid.is_some() && current.vmi_uid.as_deref() == vmi_uid)
+        }
+    }
+}
+
+/// Drops boot-hold reports that no longer describe the VM (see [`boot_hold_is_stale`]).
+async fn clear_stale_boot_holds(
+    ctx: &Ctx,
+    namespace: &str,
+    claims: &[BootHoldClaim],
+    vmi_uid: Option<&str>,
+) -> anyhow::Result<bool> {
+    let mut requeue = false;
+    for claim in claims
+        .iter()
+        .filter(|claim| boot_hold_is_stale(claim.current.as_ref(), vmi_uid))
+    {
+        let api: Api<UsbDeviceClaim> = Api::namespaced(ctx.client.clone(), namespace);
+        let patch = json!({ "status": { "bootHold": Value::Null } });
+        match api
+            .patch_status(&claim.name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await
+        {
+            Ok(_) => debug!(claim = %format!("{namespace}/{}", claim.name), "cleared a stale boot hold"),
+            Err(err) if util::is_not_found(&err) => {}
+            Err(err) => {
+                warn!(claim = %format!("{namespace}/{}", claim.name), "clearing the boot hold failed: {err:#}");
+                requeue = true;
+            }
         }
     }
     Ok(requeue)
@@ -679,6 +959,7 @@ mod tests {
                 vm_name: "my-vm".into(),
                 selector: DeviceSelector::default(),
                 slot: None,
+                hold_boot: None,
             },
         );
         c.status = Some(UsbDeviceClaimStatus {
@@ -696,6 +977,9 @@ mod tests {
             phase: Some(if running { "Running" } else { "Scheduling" }.into()),
             node: running.then(|| "node-a".to_string()),
             client_passthrough: passthrough,
+            start_paused: false,
+            paused: false,
+            paused_since: None,
             active_pods: BTreeMap::new(),
             controlled_by_vm: true,
             deleting: false,
@@ -708,9 +992,187 @@ mod tests {
             name: "my-vm".into(),
             uid: "vm-uid".into(),
             client_passthrough: passthrough,
+            start_paused: false,
             printable_status: Some("Stopped".into()),
             deleting,
         }
+    }
+
+    /// An instance started with `startStrategy: Paused` that is still waiting.
+    fn paused_vmi(since: &str) -> VmiInfo {
+        VmiInfo {
+            start_paused: true,
+            paused: true,
+            paused_since: Some(since.into()),
+            ..vmi(true, true)
+        }
+    }
+
+    fn holding_vm() -> VmInfo {
+        VmInfo {
+            start_paused: true,
+            ..vm(true, false)
+        }
+    }
+
+    fn hold(name: &str, ready: bool) -> BootHoldClaim {
+        BootHoldClaim {
+            name: name.into(),
+            ready,
+            invalid: false,
+            timeout_seconds: 300,
+            current: None,
+        }
+    }
+
+    fn decide(claims: &[BootHoldClaim], vmi: Option<&VmiInfo>, now: &str) -> BootHoldAction {
+        decide_boot_hold(&BootHoldInputs {
+            vm: Some(&holding_vm()),
+            vmi,
+            claims,
+            already_released: false,
+            now: now.parse().unwrap(),
+        })
+    }
+
+    const PAUSED_AT: &str = "2026-09-17T12:00:00Z";
+
+    #[test]
+    fn boot_hold_waits_for_every_device_then_resumes() {
+        let paused = paused_vmi(PAUSED_AT);
+        assert_eq!(
+            decide(
+                &[hold("a", true), hold("b", false)],
+                Some(&paused),
+                "2026-09-17T12:01:00Z"
+            ),
+            BootHoldAction::Hold("waiting for b (240s left)".into())
+        );
+        assert_eq!(
+            decide(
+                &[hold("a", true), hold("b", true)],
+                Some(&paused),
+                "2026-09-17T12:01:00Z"
+            ),
+            BootHoldAction::Release("all 2 devices are ready".into())
+        );
+        assert_eq!(
+            decide(&[hold("a", true)], Some(&paused), "2026-09-17T12:01:00Z"),
+            BootHoldAction::Release("the device is ready".into())
+        );
+    }
+
+    #[test]
+    fn boot_hold_gives_up_so_a_missing_device_cannot_block_a_boot() {
+        let paused = paused_vmi(PAUSED_AT);
+        assert_eq!(
+            decide(&[hold("a", false)], Some(&paused), "2026-09-17T12:05:00Z"),
+            BootHoldAction::Release("gave up after 300s; booting without a".into())
+        );
+        // `0` waits forever, so the VM stays paused however long it takes.
+        let forever = BootHoldClaim {
+            timeout_seconds: 0,
+            ..hold("a", false)
+        };
+        assert_eq!(
+            decide(&[forever], Some(&paused), "2026-09-17T13:00:00Z"),
+            BootHoldAction::Hold("waiting for a".into())
+        );
+    }
+
+    #[test]
+    fn boot_hold_needs_a_vm_that_starts_paused() {
+        let running = vmi(true, true);
+        let claims = [hold("a", false)];
+        // The VM's template lacks `startStrategy: Paused`, which is worth saying before it starts.
+        assert_eq!(
+            decide_boot_hold(&BootHoldInputs {
+                vm: Some(&vm(true, false)),
+                vmi: None,
+                claims: &claims,
+                already_released: false,
+                now: PAUSED_AT.parse().unwrap(),
+            }),
+            BootHoldAction::NotConfigured(
+                "the VM does not start paused; set spec.template.spec.startStrategy: Paused in its template to hold its boot".into()
+            )
+        );
+        // Configured, but the VM is stopped, or its instance started before the template said so
+        // and will be held on its next start: nothing to hold now, and nothing to complain about.
+        assert_eq!(decide(&claims, None, PAUSED_AT), BootHoldAction::Nothing);
+        assert_eq!(decide(&claims, Some(&running), PAUSED_AT), BootHoldAction::Nothing);
+    }
+
+    #[test]
+    fn boot_hold_never_resumes_a_pause_it_did_not_cause() {
+        let paused = paused_vmi(PAUSED_AT);
+        let claims = [hold("a", true)];
+        assert_eq!(
+            decide_boot_hold(&BootHoldInputs {
+                vm: Some(&holding_vm()),
+                vmi: Some(&paused),
+                claims: &claims,
+                already_released: true,
+                now: "2026-09-17T12:01:00Z".parse().unwrap(),
+            }),
+            BootHoldAction::Nothing,
+            "a VM paused again after its boot was released stays paused"
+        );
+        // A deleted instance is not resumed either.
+        let deleting = VmiInfo {
+            deleting: true,
+            ..paused
+        };
+        assert_eq!(
+            decide(&claims, Some(&deleting), "2026-09-17T12:01:00Z"),
+            BootHoldAction::Nothing
+        );
+    }
+
+    #[test]
+    fn stale_boot_hold_reports_are_dropped() {
+        let report = |state, uid: Option<&str>| BootHoldStatus {
+            state,
+            vmi_uid: uid.map(Into::into),
+            since: PAUSED_AT.into(),
+            message: None,
+        };
+        // Advice to configure the VM, once its template has it: gone (this is what a user sees
+        // right after patching `startStrategy: Paused` into the template).
+        assert!(boot_hold_is_stale(
+            Some(&report(BootHoldState::NotConfigured, None)),
+            Some("vmi-1")
+        ));
+        // The release record of the running instance stays: it is also what stops us from
+        // resuming that instance again if someone pauses it later.
+        assert!(!boot_hold_is_stale(
+            Some(&report(BootHoldState::Released, Some("vmi-1"))),
+            Some("vmi-1")
+        ));
+        // The record of an instance that has been replaced, or of one that is gone, does not.
+        assert!(boot_hold_is_stale(
+            Some(&report(BootHoldState::Released, Some("vmi-0"))),
+            Some("vmi-1")
+        ));
+        assert!(boot_hold_is_stale(
+            Some(&report(BootHoldState::Released, Some("vmi-1"))),
+            None
+        ));
+        assert!(!boot_hold_is_stale(None, Some("vmi-1")));
+    }
+
+    #[test]
+    fn invalid_claims_do_not_hold_a_boot() {
+        let paused = paused_vmi(PAUSED_AT);
+        let invalid = BootHoldClaim {
+            invalid: true,
+            ..hold("a", false)
+        };
+        assert_eq!(
+            decide(&[invalid], Some(&paused), "2026-09-17T12:01:00Z"),
+            BootHoldAction::Nothing,
+            "a claim that can never attach must not keep the VM paused"
+        );
     }
 
     fn phase_of(
@@ -762,6 +1224,7 @@ mod tests {
                 slot,
                 since: "2026-09-16T12:00:00Z".into(),
                 message: None,
+                awaiting_resume: None,
             }))
         };
         assert_eq!(

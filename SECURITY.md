@@ -25,7 +25,7 @@ not in public issues.
 | 6 | Device identities are not authentication | Medium | Physical security; precise selectors |
 | 7 | Attaching a device takes it away from the host | Medium | `agent.ignore` for host-critical devices |
 | 8 | Guest ↔ host USB attack surface | Medium | Only attach devices to trusted VMs |
-| 9 | Agents and controller read every VMI, including inline cloud-init data | Medium | Keep secrets out of inline cloud-init |
+| 9 | Agents and controller read every VMI, including inline cloud-init data; the controller may resume any paused VM | Medium | Keep secrets out of inline cloud-init; drop the `unpause` rule if unused |
 | 10 | Denial of service by claim squatting (stopped VMs) or connection floods | Low–Medium | Admission policy; NetworkPolicy |
 | 11 | Device inventory (serial numbers, locations) is visible cluster-wide | Low | RBAC on `usbdevices` |
 
@@ -177,6 +177,13 @@ between tenants.
 Agents and the controller list and watch `VirtualMachineInstance` objects in all namespaces. VMI
 specs contain inline cloud-init `userData`, which often includes passwords or SSH keys. Prefer
 `userDataSecretRef` / `networkDataSecretRef` for secrets.
+
+The controller additionally holds `update` on `virtualmachineinstances/unpause` in every namespace,
+which is what releases a held boot (`holdBoot`). It never pauses a VM and only resumes an instance
+that started paused and has claims holding it, but the permission itself is cluster-wide: a
+compromised controller could resume any paused VM, including one paused for a snapshot or for
+forensics. Drop that rule from the controller `ClusterRole` if no claim uses `holdBoot` (a VM whose
+claims do would then stay paused until someone runs `virtctl unpause`).
 
 ### 10. Denial of service
 

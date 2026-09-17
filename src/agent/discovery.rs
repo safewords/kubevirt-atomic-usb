@@ -1,6 +1,7 @@
 //! Discovers USB devices on this node and keeps their `UsbDevice` objects up to date.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,6 +26,10 @@ const FIELD_MANAGER: &str = "atomic-usb-agent";
 const UEVENT_SETTLE: Duration = Duration::from_millis(500);
 /// Rescan interval while an identity is waiting to be released by another node.
 const DEFERRED_RESCAN: Duration = Duration::from_secs(3);
+/// Cap on a single API write. Heartbeats are what keep devices out of `Lost`, so a request that
+/// hangs (a black-holed connection survives in the kernel far longer than the client's patience)
+/// must not stall the scan loop: it is given up on, logged, and retried on the next scan.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct Discovery {
     config: Arc<AgentConfig>,
@@ -69,6 +74,7 @@ impl Discovery {
         };
 
         loop {
+            let started = Instant::now();
             let deferred = match self.scan_once().await {
                 Ok(deferred) => deferred,
                 Err(err) => {
@@ -76,6 +82,14 @@ impl Discovery {
                     false
                 }
             };
+            // A scan that outlasts the heartbeat interval is why devices start being reported
+            // `Lost`; say so, because the gap is otherwise invisible in the log.
+            if started.elapsed() >= self.config.heartbeat_interval {
+                warn!(
+                    seconds = started.elapsed().as_secs(),
+                    "the scan took longer than the heartbeat interval; devices of this node may be reported lost"
+                );
+            }
             let interval = if deferred {
                 DEFERRED_RESCAN.min(self.config.scan_interval)
             } else {
@@ -220,7 +234,7 @@ impl Discovery {
                 .publish(name, device, *source, objects_by_name.get(name).copied(), now)
                 .await
             {
-                warn!(device = %name, %err, "failed to publish device");
+                warn!(device = %name, "failed to publish device: {err:#}");
             }
         }
         for obj in &objects {
@@ -243,7 +257,7 @@ impl Discovery {
         source: IdentitySource,
         existing: Option<&UsbDevice>,
         now: jiff::Timestamp,
-    ) -> kube::Result<()> {
+    ) -> anyhow::Result<()> {
         let spec = UsbDeviceSpec {
             vendor_id: device.vendor_id.clone(),
             product_id: device.product_id.clone(),
@@ -272,9 +286,12 @@ impl Discovery {
                 "metadata": { "name": name, "labels": labels },
                 "spec": spec,
             });
-            self.api
-                .patch(name, &PatchParams::apply(FIELD_MANAGER).force(), &Patch::Apply(&object))
-                .await?;
+            bounded(
+                "updating the device",
+                self.api
+                    .patch(name, &PatchParams::apply(FIELD_MANAGER).force(), &Patch::Apply(&object)),
+            )
+            .await?;
         }
 
         let desired = json!({
@@ -314,9 +331,12 @@ impl Discovery {
 
         let mut body = desired.clone();
         body["lastSeen"] = json!(util::rfc3339(now));
-        self.api
-            .patch_status(name, &PatchParams::default(), &Patch::Merge(&json!({ "status": body })))
-            .await?;
+        bounded(
+            "the heartbeat",
+            self.api
+                .patch_status(name, &PatchParams::default(), &Patch::Merge(&json!({ "status": body }))),
+        )
+        .await?;
         if !status_current {
             debug!(device = %name, "status updated");
         }
@@ -338,17 +358,29 @@ impl Discovery {
                 "message": format!("unplugged from {} at {}", self.config.node, util::rfc3339(now)),
             }
         });
-        match self
-            .api
-            .patch_status(&name, &PatchParams::default(), &Patch::Merge(&patch))
-            .await
+        match tokio::time::timeout(
+            WRITE_TIMEOUT,
+            self.api
+                .patch_status(&name, &PatchParams::default(), &Patch::Merge(&patch)),
+        )
+        .await
         {
-            Ok(_) => info!(device = %name, "device unplugged"),
-            Err(err) if util::is_conflict(&err) || util::is_not_found(&err) => {
+            Ok(Ok(_)) => info!(device = %name, "device unplugged"),
+            Ok(Err(err)) if util::is_conflict(&err) || util::is_not_found(&err) => {
                 debug!(device = %name, "device changed concurrently; re-evaluating on next scan")
             }
-            Err(err) => warn!(device = %name, %err, "failed to mark device unplugged"),
+            Ok(Err(err)) => warn!(device = %name, %err, "failed to mark device unplugged"),
+            Err(_) => warn!(device = %name, "marking the device unplugged timed out; retrying on the next scan"),
         }
+    }
+}
+
+/// Runs one API write with [`WRITE_TIMEOUT`], so a hung request fails loudly instead of holding up
+/// every device's heartbeat.
+async fn bounded<T>(what: &str, request: impl Future<Output = kube::Result<T>>) -> anyhow::Result<T> {
+    match tokio::time::timeout(WRITE_TIMEOUT, request).await {
+        Ok(result) => Ok(result?),
+        Err(_) => anyhow::bail!("{what} timed out after {}s", WRITE_TIMEOUT.as_secs()),
     }
 }
 

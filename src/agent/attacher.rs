@@ -314,20 +314,8 @@ async fn attempt(ctx: &Context, spec: &SessionSpec, reporter: &mut Reporter) -> 
     let mut vm = launcher::connect(&socket)
         .await
         .map_err(|e| Failed(format!("connecting to {}: {e}", socket.display())))?;
-    // A slot that is already in use (e.g. by `virtctl usbredir`) accepts nothing and stays silent.
     let mut greeting = vec![0u8; 64 * 1024];
-    let n = timeout(QEMU_GREETING_TIMEOUT, vm.read(&mut greeting))
-        .await
-        .map_err(|_| {
-            Failed(format!(
-                "QEMU did not answer on {}; is the slot used by another usbredir client?",
-                launcher::socket_name(spec.slot)
-            ))
-        })?
-        .map_err(|e| Failed(format!("reading from QEMU: {e}")))?;
-    if n == 0 {
-        return Err(Failed("QEMU closed the usbredir socket".into()));
-    }
+    let n = read_greeting(ctx, spec, &mut vm, &mut greeting, reporter, &source_node).await?;
     tcp.write_all(&greeting[..n])
         .await
         .map_err(|e| Failed(format!("forwarding to exporter: {e}")))?;
@@ -349,11 +337,57 @@ async fn attempt(ctx: &Context, spec: &SessionSpec, reporter: &mut Reporter) -> 
     Ok(started.elapsed())
 }
 
+/// Reads QEMU's usbredir hello, which only arrives once the VM's vCPUs run.
+///
+/// QEMU neither reads nor writes a usbredir chardev while the VM is not running, so a VM started
+/// with `startStrategy: Paused` stays silent. Everything on our side is in place by then, so
+/// report the device as awaiting the resume — that is what releases a held boot (see
+/// `UsbDeviceClaimSpec::hold_boot`) — and keep the session open. QEMU greets us within
+/// milliseconds of the resume, long before the guest's firmware looks at the USB bus, so the guest
+/// finds the device plugged in from its very first boot.
+///
+/// A silent QEMU on a *running* VM is a different matter: the slot is taken by another usbredir
+/// client (e.g. `virtctl usbredir`), which stays an error.
+async fn read_greeting(
+    ctx: &Context,
+    spec: &SessionSpec,
+    vm: &mut tokio::net::UnixStream,
+    buffer: &mut [u8],
+    reporter: &mut Reporter,
+    source_node: &str,
+) -> Result<usize, AttemptError> {
+    loop {
+        let paused = ctx
+            .vmi(&spec.claim.namespace, &spec.vm_name)
+            .is_some_and(|vmi| vmi.paused);
+        if paused {
+            reporter
+                .report_awaiting_resume(format!(
+                    "ready on {} with the device from {source_node}; waiting for the VM to resume",
+                    launcher::socket_name(spec.slot)
+                ))
+                .await;
+        }
+        match timeout(QEMU_GREETING_TIMEOUT, vm.read(buffer)).await {
+            Ok(Ok(0)) => return Err(AttemptError::Failed("QEMU closed the usbredir socket".into())),
+            Ok(Ok(n)) => return Ok(n),
+            Ok(Err(err)) => return Err(AttemptError::Failed(format!("reading from QEMU: {err}"))),
+            Err(_) if paused => continue,
+            Err(_) => {
+                return Err(AttemptError::Failed(format!(
+                    "QEMU did not answer on {}; is the slot used by another usbredir client?",
+                    launcher::socket_name(spec.slot)
+                )));
+            }
+        }
+    }
+}
+
 /// Writes `status.connection` of the claim when it changes.
 struct Reporter {
     ctx: Arc<Context>,
     spec: SessionSpec,
-    last: Option<(ConnectionState, String)>,
+    last: Option<(ConnectionState, String, bool)>,
     since: String,
 }
 
@@ -368,10 +402,24 @@ impl Reporter {
     }
 
     async fn report(&mut self, state: ConnectionState, message: String) {
-        let changed_state = self.last.as_ref().is_none_or(|(s, _)| *s != state);
-        if self.last.as_ref().is_some_and(|(s, m)| *s == state && *m == message) {
+        self.report_with(state, message, false).await
+    }
+
+    /// The device is spliced onto the slot and only the paused VM is missing (see
+    /// [`read_greeting`]); the controller releases held boots on this.
+    async fn report_awaiting_resume(&mut self, message: String) {
+        self.report_with(ConnectionState::Connecting, message, true).await
+    }
+
+    async fn report_with(&mut self, state: ConnectionState, message: String, awaiting_resume: bool) {
+        let entry = (state, message, awaiting_resume);
+        if self.last.as_ref() == Some(&entry) {
             return;
         }
+        let changed_state = self
+            .last
+            .as_ref()
+            .is_none_or(|(s, _, a)| *s != state || *a != awaiting_resume);
         // Do not overwrite the report of another node that took over the VM (migration).
         let current = self
             .ctx
@@ -383,9 +431,10 @@ impl Reporter {
                 .as_ref()
                 .is_some_and(|c| c.node != self.ctx.config.node && c.state == ConnectionState::Connected)
         {
-            self.last = Some((state, message));
+            self.last = Some(entry);
             return;
         }
+        let (state, message, awaiting_resume) = entry;
         if changed_state {
             self.since = util::rfc3339(util::now());
             let claim = format!("{}/{}", self.spec.claim.namespace, self.spec.claim.name);
@@ -398,7 +447,11 @@ impl Reporter {
             slot: self.spec.slot,
             since: self.since.clone(),
             message: Some(message.clone()),
+            awaiting_resume: awaiting_resume.then_some(true),
         };
+        let mut connection = serde_json::to_value(&connection).expect("connection status is serializable");
+        // A merge patch only drops a field that is explicitly null, so clear a stale flag.
+        connection["awaitingResume"] = json!(awaiting_resume.then_some(true));
         let api: Api<UsbDeviceClaim> =
             Api::namespaced(self.ctx.claims_api.clone().into_client(), &self.spec.claim.namespace);
         let patch = json!({ "status": { "connection": connection } });
@@ -406,8 +459,8 @@ impl Reporter {
             .patch_status(&self.spec.claim.name, &PatchParams::default(), &Patch::Merge(&patch))
             .await
         {
-            Ok(_) => self.last = Some((state, message)),
-            Err(err) if util::is_not_found(&err) => self.last = Some((state, message)),
+            Ok(_) => self.last = Some((state, message, awaiting_resume)),
+            Err(err) if util::is_not_found(&err) => self.last = Some((state, message, awaiting_resume)),
             Err(err) => debug!(%err, "failed to report connection state"),
         }
     }

@@ -1,0 +1,29 @@
+# A claim that holds its VM's boot until the device is there.
+#
+# Use this for a guest that only looks for its device while it starts (a home automation service
+# opening a Zigbee radio, a daemon checking for a licence dongle): hotplugging the device after the
+# guest is up would not help, because nothing in the guest goes looking again.
+#
+# The VM must start paused, which takes effect on its next start:
+#
+#   kubectl patch vm my-vm --type merge \
+#     -p '{"spec":{"template":{"spec":{"startStrategy":"Paused"}}}}'
+#
+# atomic-usb then splices the device onto the paused VM's usbredir slot and resumes the VM, so the
+# guest finds the device plugged in from its first boot. Watch it happen with
+#
+#   kubectl get usbclaim zigbee-radio -o jsonpath='{.status.bootHold}'
+apiVersion: atomicusb.safewords.io/v1alpha1
+kind: UsbDeviceClaim
+metadata:
+  name: zigbee-radio
+  namespace: default
+spec:
+  vmName: my-vm
+  selector:
+    vendorId: "1a86"
+    productId: "7523"
+  holdBoot:
+    # Boot without the device after this long (default 300). `0` waits forever, which leaves the VM
+    # paused until the device turns up.
+    timeoutSeconds: 300

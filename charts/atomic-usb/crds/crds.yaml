@@ -214,6 +214,10 @@ spec:
       name: Slot
       priority: 1
       type: integer
+    - jsonPath: .status.bootHold.state
+      name: Boot-Hold
+      priority: 1
+      type: string
     - jsonPath: .status.message
       name: Message
       priority: 1
@@ -236,7 +240,29 @@ spec:
 
               The claim belongs to its VM: a stopped VM keeps the device reserved, while deleting the VM
               releases the device and garbage-collects the claim.
+
+              With `holdBoot`, a VM that starts paused waits for its device instead of booting without it.
             properties:
+              holdBoot:
+                description: |-
+                  Keep the VM's vCPUs paused after it starts until this device is ready, so the guest never
+                  boots without it (a guest that boots first often never picks the device up: think of a
+                  serial radio a home automation service opens once at startup).
+
+                  Requires `spec.template.spec.startStrategy: Paused` on the VM. KubeVirt then starts the VM
+                  paused, atomic-usb splices the device onto its usbredir slot, and resumes the VM once every
+                  claim of it that holds the boot is ready, or `timeoutSeconds` have passed.
+                nullable: true
+                properties:
+                  timeoutSeconds:
+                    description: |-
+                      Let the VM boot without the device after this many seconds (default 300). `0` waits
+                      forever, which leaves a VM whose device never appears paused indefinitely.
+                    format: int64
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                type: object
               selector:
                 description: Which device to attach. All specified fields must match; at least one is required.
                 properties:
@@ -288,10 +314,43 @@ spec:
           status:
             nullable: true
             properties:
+              bootHold:
+                description: Whether this claim is holding the boot of the VM's current instance (see `spec.holdBoot`).
+                nullable: true
+                properties:
+                  message:
+                    nullable: true
+                    type: string
+                  since:
+                    description: RFC 3339 time of the last state change.
+                    type: string
+                  state:
+                    enum:
+                    - Holding
+                    - Released
+                    - NotConfigured
+                    type: string
+                  vmiUid:
+                    description: |-
+                      UID of the `VirtualMachineInstance` this applies to. A restarted VM is a new instance and
+                      is held again.
+                    nullable: true
+                    type: string
+                required:
+                - since
+                - state
+                type: object
               connection:
                 description: Data path state, reported by the agent on the VM's node.
                 nullable: true
                 properties:
+                  awaitingResume:
+                    description: |-
+                      The device is spliced onto the VM's usbredir slot and waits for the VM to resume: a paused
+                      QEMU does not touch its usbredir chardev, so the device is only taken once the vCPUs run.
+                      This is what lets the controller release a held boot (see `spec.holdBoot`).
+                    nullable: true
+                    type: boolean
                   deviceName:
                     type: string
                   message:
