@@ -5,6 +5,10 @@
 //!
 //! Leases are written with a `resourceVersion` precondition: two claims (or two controller
 //! replicas) racing for the same device can never both win.
+//!
+//! A claim's lifetime is bound to its VM: the controller adds an owner reference to the
+//! `VirtualMachine` (or bare VMI), so Kubernetes garbage-collects the claim when the VM is deleted,
+//! and a claim only holds a device while its VM exists.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -20,7 +24,9 @@ use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
 use crate::crd::{Attachment, ClaimPhase, ConnectionState, DevicePhase, UsbDevice, UsbDeviceClaim};
-use crate::kubevirt::{USBREDIR_SLOTS, VmiInfo, vmi_resource};
+use crate::kubevirt::{
+    USBREDIR_SLOTS, VmInfo, VmiInfo, claim_owner_references, vm_owner, vm_present, vm_resource, vmi_resource,
+};
 use crate::util;
 
 #[derive(Clone, Debug)]
@@ -38,6 +44,7 @@ struct Ctx {
     devices_api: Api<UsbDevice>,
     claims: Store<UsbDeviceClaim>,
     devices: Store<UsbDevice>,
+    vms: Store<DynamicObject>,
     vmis: Store<DynamicObject>,
 }
 
@@ -51,6 +58,12 @@ pub async fn run(client: Client, config: ControllerConfig) -> anyhow::Result<()>
     let devices_api: Api<UsbDevice> = Api::all(client.clone());
     let devices = crate::watch::reflect(devices_api.clone(), (), &changes);
     let claims = crate::watch::reflect(Api::<UsbDeviceClaim>::all(client.clone()), (), &changes);
+    let vms = crate::watch::reflect_with(
+        Api::<DynamicObject>::all_with(client.clone(), &vm_resource()),
+        vm_resource(),
+        Default::default(),
+        &changes,
+    );
     let vmis = crate::watch::reflect_with(
         Api::<DynamicObject>::all_with(client.clone(), &vmi_resource()),
         vmi_resource(),
@@ -60,6 +73,7 @@ pub async fn run(client: Client, config: ControllerConfig) -> anyhow::Result<()>
     tokio::try_join!(
         devices.wait_until_ready(),
         claims.wait_until_ready(),
+        vms.wait_until_ready(),
         vmis.wait_until_ready()
     )
     .context("waiting for initial lists")?;
@@ -75,6 +89,7 @@ pub async fn run(client: Client, config: ControllerConfig) -> anyhow::Result<()>
         devices_api,
         claims,
         devices,
+        vms,
         vmis,
     });
     let mut rx = changes.subscribe();
@@ -142,6 +157,13 @@ async fn reconcile_all(ctx: &Ctx) -> anyhow::Result<bool> {
         .collect();
     claims.sort_by_key(|c| (c.creation_timestamp().map(|t| t.0), c.namespace(), c.name_any()));
     let live_claims: HashSet<String> = claims.iter().filter_map(|c| c.uid()).collect();
+    let vms: HashMap<(String, String), VmInfo> = ctx
+        .vms
+        .state()
+        .iter()
+        .filter_map(|o| VmInfo::from_object(o))
+        .map(|v| ((v.namespace.clone(), v.name.clone()), v))
+        .collect();
     let vmis: HashMap<(String, String), VmiInfo> = ctx
         .vmis
         .state()
@@ -202,7 +224,7 @@ async fn reconcile_all(ctx: &Ctx) -> anyhow::Result<bool> {
     );
 
     for claim in &claims {
-        match reconcile_claim(ctx, claim, &mut devices, &vmis, &slots, now).await {
+        match reconcile_claim(ctx, claim, &mut devices, &vms, &vmis, &slots, now).await {
             Ok(r) => requeue |= r,
             Err(err) => {
                 warn!(claim = %format!("{}/{}", claim.namespace().unwrap_or_default(), claim.name_any()), "reconcile failed: {err:#}");
@@ -217,6 +239,7 @@ async fn reconcile_claim(
     ctx: &Ctx,
     claim: &UsbDeviceClaim,
     devices: &mut BTreeMap<String, UsbDevice>,
+    vms: &HashMap<(String, String), VmInfo>,
     vmis: &HashMap<(String, String), VmiInfo>,
     slots: &HashMap<String, Result<i32, String>>,
     now: jiff::Timestamp,
@@ -227,6 +250,36 @@ async fn reconcile_claim(
     let selector = &claim.spec.selector;
     let previous = claim.status.clone().unwrap_or_default();
     let mut requeue = false;
+    let vm_key = (namespace.clone(), claim.spec.vm_name.clone());
+    let (vm, vmi) = (vms.get(&vm_key), vmis.get(&vm_key));
+
+    // Bind the claim's lifetime to its VM so deleting the VM garbage-collects the claim.
+    if !claim.spec.vm_name.is_empty()
+        && let Some(owner_references) = claim_owner_references(
+            claim.owner_references(),
+            &claim.spec.vm_name,
+            vm_owner(vm, vmi).as_ref(),
+        )
+    {
+        let api: Api<UsbDeviceClaim> = Api::namespaced(ctx.client.clone(), &namespace);
+        let patch = json!({
+            "metadata": { "resourceVersion": claim.resource_version(), "ownerReferences": owner_references }
+        });
+        match api
+            .patch(&claim.name_any(), &PatchParams::default(), &Patch::Merge(&patch))
+            .await
+        {
+            Ok(_) => info!(
+                claim = %format!("{namespace}/{}", claim.name_any()),
+                owners = ?owner_references.iter().map(|r| format!("{}/{}", r.kind, r.name)).collect::<Vec<_>>(),
+                "updated claim owner references"
+            ),
+            Err(err) if util::is_conflict(&err) || util::is_not_found(&err) => requeue = true,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    // Only a claim whose VM exists may hold a device; a deleted VM releases it right away.
+    let vm_present = vm_present(vm, vmi);
 
     let invalid = selector
         .validate()
@@ -246,7 +299,7 @@ async fn reconcile_claim(
         .map(|d| d.name_any())
         .collect();
     let mut target: Option<String> = None;
-    if invalid.is_none() {
+    if invalid.is_none() && vm_present {
         let current = held
             .iter()
             .filter(|n| selector.matches(&devices[*n]))
@@ -314,7 +367,9 @@ async fn reconcile_claim(
         invalid: invalid.as_deref(),
         device,
         device_available: device.is_some_and(|d| d.is_available(now, lost_after)),
-        vmi: vmis.get(&(namespace.clone(), claim.spec.vm_name.clone())),
+        vm,
+        vmi,
+        vm_present,
         claim,
         slot,
     });
@@ -378,7 +433,10 @@ pub struct PhaseInputs<'a> {
     pub invalid: Option<&'a str>,
     pub device: Option<&'a UsbDevice>,
     pub device_available: bool,
+    pub vm: Option<&'a VmInfo>,
     pub vmi: Option<&'a VmiInfo>,
+    /// The VM exists and is not being deleted (see [`vm_present`]).
+    pub vm_present: bool,
     pub claim: &'a UsbDeviceClaim,
     pub slot: Option<i32>,
 }
@@ -386,6 +444,18 @@ pub struct PhaseInputs<'a> {
 pub fn compute_phase(inputs: &PhaseInputs) -> (ClaimPhase, String) {
     if let Some(reason) = inputs.invalid {
         return (ClaimPhase::Invalid, reason.to_string());
+    }
+    let vm = &inputs.claim.spec.vm_name;
+    if !inputs.vm_present {
+        let state = if inputs.vm.is_some_and(|v| v.deleting) || inputs.vmi.is_some_and(|v| v.deleting) {
+            "is being deleted"
+        } else {
+            "does not exist"
+        };
+        return (
+            ClaimPhase::WaitingForVM,
+            format!("VirtualMachine {vm} {state}; no device is reserved"),
+        );
     }
     let Some(device) = inputs.device else {
         return (ClaimPhase::Pending, "no free UsbDevice matches the selector".into());
@@ -407,19 +477,25 @@ pub fn compute_phase(inputs: &PhaseInputs) -> (ClaimPhase, String) {
             format!("device {device_name} is {phase}{node}"),
         );
     }
-    let vm = &inputs.claim.spec.vm_name;
-    let Some(vmi) = inputs.vmi else {
-        return (
-            ClaimPhase::WaitingForVM,
-            format!("VirtualMachineInstance {vm} does not exist"),
-        );
+    // A running VMI reflects the configuration the VM was started with; the template applies next.
+    let client_passthrough = match (inputs.vmi, inputs.vm) {
+        (Some(vmi), _) => vmi.client_passthrough,
+        (None, Some(vm)) => vm.client_passthrough,
+        (None, None) => true,
     };
-    if !vmi.client_passthrough {
+    if !client_passthrough {
         return (
             ClaimPhase::VMNotConfigured,
             "VM needs spec.domain.devices.clientPassthrough: {} (set it in the VM template and restart)".into(),
         );
     }
+    let Some(vmi) = inputs.vmi else {
+        let status = inputs
+            .vm
+            .and_then(|v| v.printable_status.as_deref())
+            .unwrap_or("Stopped");
+        return (ClaimPhase::WaitingForVM, format!("VirtualMachine {vm} is {status}"));
+    };
     if !vmi.is_running() {
         return (
             ClaimPhase::WaitingForVM,
@@ -621,7 +697,38 @@ mod tests {
             node: running.then(|| "node-a".to_string()),
             client_passthrough: passthrough,
             active_pods: BTreeMap::new(),
+            controlled_by_vm: true,
+            deleting: false,
         }
+    }
+
+    fn vm(passthrough: bool, deleting: bool) -> VmInfo {
+        VmInfo {
+            namespace: "default".into(),
+            name: "my-vm".into(),
+            uid: "vm-uid".into(),
+            client_passthrough: passthrough,
+            printable_status: Some("Stopped".into()),
+            deleting,
+        }
+    }
+
+    fn phase_of(
+        device: Option<&UsbDevice>,
+        vm: Option<&VmInfo>,
+        vmi: Option<&VmiInfo>,
+        claim: &UsbDeviceClaim,
+    ) -> (ClaimPhase, String) {
+        compute_phase(&PhaseInputs {
+            invalid: None,
+            device,
+            device_available: device.is_some_and(|d| d.status_ref().phase == Some(DevicePhase::Available)),
+            vm,
+            vmi,
+            vm_present: crate::kubevirt::vm_present(vm, vmi),
+            claim,
+            slot: Some(3),
+        })
     }
 
     #[test]
@@ -629,24 +736,17 @@ mod tests {
         let c = claim(None);
         let dev = device(true);
         let unplugged = device(false);
+        let the_vm = vm(true, false);
         let running = vmi(true, true);
         let phase = |device: Option<&UsbDevice>, vmi: Option<&VmiInfo>, claim: &UsbDeviceClaim| {
-            compute_phase(&PhaseInputs {
-                invalid: None,
-                device,
-                device_available: device.is_some_and(|d| d.status_ref().phase == Some(DevicePhase::Available)),
-                vmi,
-                claim,
-                slot: Some(3),
-            })
-            .0
+            phase_of(device, Some(&the_vm), vmi, claim).0
         };
         assert_eq!(phase(None, Some(&running), &c), ClaimPhase::Pending);
         assert_eq!(
             phase(Some(&unplugged), Some(&running), &c),
             ClaimPhase::DeviceUnavailable
         );
-        assert_eq!(phase(Some(&dev), None, &c), ClaimPhase::WaitingForVM);
+        assert_eq!(phase(Some(&dev), None, &c), ClaimPhase::WaitingForVM, "stopped VM");
         assert_eq!(phase(Some(&dev), Some(&vmi(false, true)), &c), ClaimPhase::WaitingForVM);
         assert_eq!(
             phase(Some(&dev), Some(&vmi(true, false)), &c),
@@ -683,10 +783,46 @@ mod tests {
             invalid: Some("bad"),
             device: None,
             device_available: false,
+            vm: None,
             vmi: None,
+            vm_present: false,
             claim: &c,
             slot: None,
         });
         assert_eq!(invalid.0, ClaimPhase::Invalid);
+    }
+
+    #[test]
+    fn vm_lifecycle_phases() {
+        let c = claim(None);
+        let dev = device(true);
+
+        let (phase, message) = phase_of(None, None, None, &c);
+        assert_eq!(phase, ClaimPhase::WaitingForVM);
+        assert_eq!(message, "VirtualMachine my-vm does not exist; no device is reserved");
+
+        let deleting = vm(true, true);
+        let (phase, message) = phase_of(Some(&dev), Some(&deleting), Some(&vmi(true, true)), &c);
+        assert_eq!(phase, ClaimPhase::WaitingForVM, "a deleted VM does not keep its device");
+        assert!(message.contains("is being deleted"), "{message}");
+
+        let (phase, message) = phase_of(Some(&dev), Some(&vm(true, false)), None, &c);
+        assert_eq!(
+            (phase, message.as_str()),
+            (ClaimPhase::WaitingForVM, "VirtualMachine my-vm is Stopped")
+        );
+
+        // A stopped VM without clientPassthrough in its template is reported before it is started.
+        assert_eq!(
+            phase_of(Some(&dev), Some(&vm(false, false)), None, &c).0,
+            ClaimPhase::VMNotConfigured
+        );
+
+        // A bare VMI (no VirtualMachine object) is a VM too.
+        let bare = VmiInfo {
+            controlled_by_vm: false,
+            ..vmi(true, true)
+        };
+        assert_eq!(phase_of(Some(&dev), None, Some(&bare), &c).0, ClaimPhase::Connecting);
     }
 }

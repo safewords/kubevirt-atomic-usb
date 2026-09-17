@@ -27,7 +27,7 @@ helm install atomic-usb atomic-usb/atomic-usb --namespace atomic-usb
 Helm does not upgrade CRDs. When upgrading, apply them first:
 
 ```sh
-helm show crds oci://ghcr.io/safewords/charts/atomic-usb --version <version> | kubectl apply --server-side -f -
+helm show crds oci://ghcr.io/safewords/charts/atomic-usb --version <version> | kubectl apply --server-side --force-conflicts -f -
 ```
 
 ## Values

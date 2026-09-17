@@ -180,6 +180,9 @@ impl UsbDevice {
 /// The VM must have `spec.template.spec.domain.devices.clientPassthrough: {}`. The device is
 /// hot-plugged into the running VM as soon as both are available, and re-attached automatically
 /// after the device is replugged (on any node) or the VM restarts or migrates.
+///
+/// The claim belongs to its VM: a stopped VM keeps the device reserved, while deleting the VM
+/// releases the device and garbage-collects the claim.
 #[derive(CustomResource, Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[kube(
     group = "atomicusb.safewords.io",

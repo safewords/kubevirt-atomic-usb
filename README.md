@@ -229,21 +229,26 @@ stateDiagram-v2
     Connecting --> Attached: stream established
     Attached --> DeviceUnavailable: device unplugged / node lost
     Attached --> Connecting: VM restarted or migrated
-    Attached --> WaitingForVM: VM stopped
+    Attached --> WaitingForVM: VM stopped (device stays reserved)
     Pending --> Invalid: bad selector or slot
+    WaitingForVM --> [*]: VM deleted (claim garbage-collected, device released)
 ```
 
 | Phase | Meaning |
 | --- | --- |
 | `Pending` | no free device matches the selector |
 | `DeviceUnavailable` | the leased device is unplugged, or its node stopped heartbeating (`Lost`) |
-| `WaitingForVM` | the VM does not exist or is not running |
+| `WaitingForVM` | the VM is stopped (device stays reserved), or does not exist (nothing reserved) |
 | `VMNotConfigured` | the VM lacks `devices.clientPassthrough` |
 | `Connecting` | the data path is being set up (details in `.status.connection.message`) |
 | `Attached` | the device is plugged into the guest |
 | `Invalid` | the claim is malformed or its slot is taken (details in `.status.message`) |
 
-Deleting the claim detaches the device from the guest and releases the lease. Selectors that match
+Deleting the claim detaches the device from the guest and releases the lease. Claims belong to
+their VM: the controller adds an owner reference to the `VirtualMachine` (or to a bare
+`VirtualMachineInstance`), so **deleting the VM releases the device and deletes its claims**. A
+stopped VM keeps its devices reserved so they come back when it starts, and a claim whose VM does
+not exist yet waits without reserving anything. Selectors that match
 several devices (e.g. only `vendorId` and `productId`) lease one of them; if it becomes unavailable
 while another matching device is free, the claim moves to that one. See [`examples/`](examples/)
 for a test VM and claims.

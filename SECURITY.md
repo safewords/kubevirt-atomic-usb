@@ -26,7 +26,7 @@ not in public issues.
 | 7 | Attaching a device takes it away from the host | Medium | `agent.ignore` for host-critical devices |
 | 8 | Guest ↔ host USB attack surface | Medium | Only attach devices to trusted VMs |
 | 9 | Agents and controller read every VMI, including inline cloud-init data | Medium | Keep secrets out of inline cloud-init |
-| 10 | Denial of service by claim squatting or connection floods | Low–Medium | Admission policy; NetworkPolicy |
+| 10 | Denial of service by claim squatting (stopped VMs) or connection floods | Low–Medium | Admission policy; NetworkPolicy |
 | 11 | Device inventory (serial numbers, locations) is visible cluster-wide | Low | RBAC on `usbdevices` |
 
 ## Trust boundaries
@@ -180,8 +180,8 @@ specs contain inline cloud-init `userData`, which often includes passwords or SS
 
 ### 10. Denial of service
 
-- **Claim squatting**: a lease is held as long as the claim exists, even when its VM does not.
-  Anyone who can create claims can reserve every free device.
+- **Claim squatting**: a lease is held as long as the claim and its VM exist, even while the VM is
+  stopped. Anyone who can create claims and VMs can reserve every free device with stopped VMs.
 - **Connection floods**: the exporter port accepts connections from any pod by default and holds
   unauthenticated connections for up to 10 seconds; there is no connection limit.
 - **Host impact**: see [7](#7-attaching-a-device-takes-it-away-from-the-host).

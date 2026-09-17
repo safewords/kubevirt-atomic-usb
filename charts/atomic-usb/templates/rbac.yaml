@@ -61,13 +61,17 @@ metadata:
     {{- include "atomic-usb.labels" . | nindent 4 }}
 rules:
   - apiGroups: ["atomicusb.safewords.io"]
-    resources: ["usbdevices", "usbdeviceclaims"]
+    resources: ["usbdevices"]
     verbs: ["get", "list", "watch"]
+  # patch: owner references that bind each claim's lifetime to its VM.
+  - apiGroups: ["atomicusb.safewords.io"]
+    resources: ["usbdeviceclaims"]
+    verbs: ["get", "list", "watch", "patch"]
   - apiGroups: ["atomicusb.safewords.io"]
     resources: ["usbdevices/status", "usbdeviceclaims/status"]
     verbs: ["patch"]
   - apiGroups: ["kubevirt.io"]
-    resources: ["virtualmachineinstances"]
+    resources: ["virtualmachines", "virtualmachineinstances"]
     verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
