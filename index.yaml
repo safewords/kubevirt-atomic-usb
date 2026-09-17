@@ -2,6 +2,27 @@ apiVersion: v1
 entries:
   atomic-usb:
   - apiVersion: v2
+    appVersion: 0.2.0
+    created: "2026-09-17T22:53:12.653525026Z"
+    description: Attach USB devices plugged into any Kubernetes node to KubeVirt VMs
+      anywhere in the cluster, with hotplug.
+    digest: 392836dab1358be104987d35f269c97b2f56025c1657589bf682689faa4c07ee
+    home: https://github.com/safewords/kubevirt-atomic-usb
+    keywords:
+    - kubevirt
+    - usb
+    - usbredir
+    - hotplug
+    - virtualization
+    kubeVersion: '>=1.27.0-0'
+    name: atomic-usb
+    sources:
+    - https://github.com/safewords/kubevirt-atomic-usb
+    type: application
+    urls:
+    - https://github.com/safewords/kubevirt-atomic-usb/releases/download/chart-atomic-usb-0.2.0/atomic-usb-0.2.0.tgz
+    version: 0.2.0
+  - apiVersion: v2
     appVersion: 0.1.0
     created: "2026-09-17T02:11:43.235360987Z"
     description: Attach USB devices plugged into any Kubernetes node to KubeVirt VMs
@@ -64,4 +85,4 @@ entries:
     urls:
     - https://github.com/safewords/kubevirt-atomic-usb/releases/download/chart-atomic-usb-0.1.0/atomic-usb-0.1.0.tgz
     version: 0.1.0
-generated: "2026-09-17T02:11:43.23537375Z"
+generated: "2026-09-17T22:53:12.653541056Z"
